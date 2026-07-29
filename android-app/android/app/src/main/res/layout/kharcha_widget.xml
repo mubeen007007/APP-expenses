@@ -1,0 +1,103 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+  android:id="@+id/widget_root"
+  android:layout_width="match_parent"
+  android:layout_height="match_parent"
+  android:background="@drawable/widget_background"
+  android:orientation="vertical"
+  android:paddingLeft="12dp"
+  android:paddingTop="8dp"
+  android:paddingRight="12dp"
+  android:paddingBottom="8dp">
+
+  <LinearLayout
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content"
+    android:gravity="center_vertical"
+    android:orientation="horizontal">
+
+    <TextView
+      android:layout_width="wrap_content"
+      android:layout_height="wrap_content"
+      android:text="KHARCHA."
+      android:textColor="#F7F4FC"
+      android:textSize="10sp"
+      android:textStyle="bold" />
+
+    <TextView
+      android:layout_width="6dp"
+      android:layout_height="6dp"
+      android:layout_marginLeft="7dp"
+      android:background="@drawable/widget_live_dot"
+      android:contentDescription="Active" />
+
+    <TextView
+      android:layout_width="0dp"
+      android:layout_height="1dp"
+      android:layout_weight="1" />
+
+    <TextView
+      android:id="@+id/widget_refresh"
+      android:layout_width="26dp"
+      android:layout_height="22dp"
+      android:contentDescription="Refresh"
+      android:gravity="center"
+      android:text="&#x21BB;"
+      android:textColor="#91899F"
+      android:textSize="15sp" />
+  </LinearLayout>
+
+  <LinearLayout
+    android:layout_width="match_parent"
+    android:layout_height="0dp"
+    android:layout_weight="1"
+    android:gravity="center_vertical"
+    android:orientation="horizontal">
+
+    <LinearLayout
+      android:layout_width="0dp"
+      android:layout_height="wrap_content"
+      android:layout_weight="1.15"
+      android:orientation="vertical">
+
+      <TextView
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="SPENT TODAY"
+        android:textColor="#81798D"
+        android:textSize="6sp"
+        android:textStyle="bold" />
+
+      <TextView
+        android:id="@+id/widget_amount"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="2dp"
+        android:contentDescription="Spent today"
+        android:ellipsize="end"
+        android:maxLines="1"
+        android:text="Rs 0"
+        android:textColor="#F7F4FC"
+        android:textSize="18sp"
+        android:textStyle="bold" />
+    </LinearLayout>
+
+    <TextView
+      android:id="@+id/widget_quick_add"
+      android:layout_width="0dp"
+      android:layout_height="34dp"
+      android:layout_marginLeft="8dp"
+      android:layout_weight="0.85"
+      android:background="@drawable/widget_quick_button"
+      android:clickable="true"
+      android:contentDescription="Open quick entry"
+      android:focusable="true"
+      android:gravity="center"
+      android:ellipsize="end"
+      android:maxLines="1"
+      android:text="+  QUICK ADD"
+      android:textColor="#FFFFFF"
+      android:textSize="9sp"
+      android:textStyle="bold" />
+  </LinearLayout>
+</LinearLayout>

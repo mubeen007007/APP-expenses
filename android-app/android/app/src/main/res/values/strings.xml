@@ -1,0 +1,4 @@
+<resources>
+  <string name="app_name">Kharcha</string>
+  <string name="widget_description">Quickly view today’s spending and add a new expense.</string>
+</resources>
