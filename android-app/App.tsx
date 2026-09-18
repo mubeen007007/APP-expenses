@@ -7,12 +7,14 @@ import * as SQLite from "expo-sqlite";
 import { StatusBar } from "expo-status-bar";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
-  Alert,
+  Animated,
   AppState,
+  Image,
   Keyboard,
   KeyboardAvoidingView,
   Linking,
   Modal,
+  PanResponder,
   PermissionsAndroid,
   Platform,
   Pressable,
@@ -23,7 +25,7 @@ import {
   TextInput,
   View,
 } from "react-native";
-import { SafeAreaProvider, SafeAreaView } from "react-native-safe-area-context";
+import { SafeAreaProvider, SafeAreaView, useSafeAreaInsets } from "react-native-safe-area-context";
 
 Notifications.setNotificationHandler({
   handleNotification: async () => ({
@@ -36,9 +38,13 @@ Notifications.setNotificationHandler({
 
 type EntryType = "debit" | "credit";
 type Tab = "home" | "activity" | "insights";
+type ThemeMode = "light" | "dark";
 type DateScope = "today" | "yesterday" | "custom" | "all";
 type OverviewScope = "today" | "yesterday" | "custom" | "month";
 type CalendarTarget = "activity" | "overview";
+type DialogTone = "neutral" | "success" | "warning" | "danger";
+type DialogAction = { text: string; style?: "cancel" | "destructive"; onPress?: () => void | Promise<void> };
+type AppDialog = { title: string; message: string; tone: DialogTone; actions: DialogAction[] };
 
 type Expense = {
   id: string;
@@ -50,16 +56,23 @@ type Expense = {
 };
 
 const COLORS = {
-  ink: "#F7F4FC",
-  muted: "#AAA4B4",
-  cream: "#0D0C12",
-  paper: "#18161F",
-  line: "#2D2935",
-  purple: "#7C68F2",
-  purpleDark: "#5D49D6",
-  coral: "#FF765B",
-  green: "#49C990",
-  gold: "#F1B950",
+  ink: "#111111",
+  muted: "#817C77",
+  cream: "#F4F1EE",
+  paper: "#FCFBF8",
+  line: "#E2DED8",
+  purple: "#8E79B6",
+  purpleDark: "#75609E",
+  coral: "#D96F61",
+  green: "#4E9C82",
+  gold: "#B98C43",
+};
+
+const DIALOG_TONES: Record<DialogTone, { icon: keyof typeof Ionicons.glyphMap; color: string; background: string }> = {
+  neutral: { icon: "sparkles-outline", color: "#75609E", background: "#E8E2F2" },
+  success: { icon: "checkmark", color: "#347B64", background: "#DCEDE7" },
+  warning: { icon: "alert-outline", color: "#9A6E28", background: "#F3E9D6" },
+  danger: { icon: "close", color: "#B55247", background: "#F3E2DE" },
 };
 
 const categoryMeta: Record<string, { color: string; icon: keyof typeof Ionicons.glyphMap }> = {
@@ -84,8 +97,10 @@ const categoryMeta: Record<string, { color: string; icon: keyof typeof Ionicons.
 const CATEGORY_OPTIONS = Object.keys(categoryMeta).filter((name) => name !== "Income");
 
 let database: SQLite.SQLiteDatabase | null = null;
+let databaseOpenInFlight: Promise<SQLite.SQLiteDatabase> | null = null;
 let nativeImportInFlight: Promise<boolean> | null = null;
 let syncLoadInFlight: Promise<void> | null = null;
+let activeThemeDark = false;
 
 const money = (value: number) =>
   `Rs ${new Intl.NumberFormat("en-PK", { maximumFractionDigits: 0 }).format(value)}`;
@@ -136,26 +151,57 @@ function categorize(description: string, type: EntryType) {
 }
 
 async function getDb() {
-  if (!database) {
-    database = await SQLite.openDatabaseAsync("kharcha.db");
-    await database.execAsync(`
-      PRAGMA busy_timeout = 5000;
-      PRAGMA journal_mode = WAL;
-      CREATE TABLE IF NOT EXISTS expenses (
-        id TEXT PRIMARY KEY NOT NULL,
-        description TEXT NOT NULL,
-        amount REAL NOT NULL,
-        type TEXT NOT NULL,
-        category TEXT NOT NULL,
-        created_at TEXT NOT NULL
-      );
-      CREATE TABLE IF NOT EXISTS settings (
-        key TEXT PRIMARY KEY NOT NULL,
-        value TEXT NOT NULL
-      );
-    `);
-  }
-  return database;
+  if (database) return database;
+  if (databaseOpenInFlight) return databaseOpenInFlight;
+
+  databaseOpenInFlight = (async () => {
+    let lastError: unknown;
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      let candidate: SQLite.SQLiteDatabase | null = null;
+      try {
+        candidate = await SQLite.openDatabaseAsync("kharcha.db");
+        await candidate.execAsync("PRAGMA busy_timeout = 10000;");
+        try {
+          await candidate.execAsync("PRAGMA journal_mode = WAL;");
+        } catch (walError) {
+          // WAL is an optimization, not a reason to hide the wallet. Some
+          // Android builds briefly hold a native read connection at startup.
+          console.warn("MoneySync will continue without changing journal mode", walError);
+        }
+        await candidate.execAsync(`
+          CREATE TABLE IF NOT EXISTS expenses (
+            id TEXT PRIMARY KEY NOT NULL,
+            description TEXT NOT NULL,
+            amount REAL NOT NULL,
+            type TEXT NOT NULL,
+            category TEXT NOT NULL,
+            created_at TEXT NOT NULL
+          );
+          CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY NOT NULL,
+            value TEXT NOT NULL
+          );
+        `);
+        database = candidate;
+        return candidate;
+      } catch (error) {
+        lastError = error;
+        if (candidate) {
+          try {
+            await candidate.closeAsync();
+          } catch {
+            // The failed connection may already be closed.
+          }
+        }
+        if (attempt < 2) await new Promise((resolve) => setTimeout(resolve, 250 * (attempt + 1)));
+      }
+    }
+    throw lastError;
+  })().finally(() => {
+    databaseOpenInFlight = null;
+  });
+
+  return databaseOpenInFlight;
 }
 
 async function syncNativeEntries() {
@@ -228,7 +274,7 @@ async function scheduleReports() {
     identifier: "kharcha-daily",
     content: {
       title: "Your daily money recap is ready",
-      body: "Open Kharcha to see today’s spending and what it means for your month.",
+      body: "Open MoneySync to see today’s spending and what it means for your month.",
       data: { screen: "insights" },
     },
     trigger: {
@@ -264,7 +310,10 @@ function DonutChart({ categories, total }: { categories: Array<{ name: string; v
 }
 
 function KharchaApp() {
+  const insets = useSafeAreaInsets();
   const [tab, setTab] = useState<Tab>("home");
+  const [themeMode, setThemeMode] = useState<ThemeMode>("light");
+  activeThemeDark = themeMode === "dark";
   const [expenses, setExpenses] = useState<Expense[]>([]);
   const [description, setDescription] = useState("");
   const [amount, setAmount] = useState("");
@@ -285,8 +334,68 @@ function KharchaApp() {
   const [editType, setEditType] = useState<EntryType>("debit");
   const [editCategory, setEditCategory] = useState("Other");
   const [smsEnabled, setSmsEnabled] = useState(false);
+  const [appDialog, setAppDialog] = useState<AppDialog | null>(null);
   const descriptionRef = useRef<TextInput>(null);
   const amountRef = useRef<TextInput>(null);
+  const pageScrollRef = useRef<ScrollView>(null);
+  const activeTabRef = useRef<Tab>(tab);
+  activeTabRef.current = tab;
+  const homeScrollY = useRef(new Animated.Value(0)).current;
+  const homeHeaderHeight = homeScrollY.interpolate({ inputRange: [-140, 0, 210], outputRange: [430, 318, 94], extrapolate: "clamp" });
+  const homeHeaderRadius = homeScrollY.interpolate({ inputRange: [0, 210], outputRange: [30, 22], extrapolate: "clamp" });
+  const expandedHeaderOpacity = homeScrollY.interpolate({ inputRange: [45, 150], outputRange: [1, 0], extrapolate: "clamp" });
+  const homeBalanceTop = homeScrollY.interpolate({ inputRange: [0, 210], outputRange: [128, 15], extrapolate: "clamp" });
+  const collapsedHeaderOpacity = homeScrollY.interpolate({ inputRange: [130, 195], outputRange: [0, 1], extrapolate: "clamp" });
+
+  const showDialog = useCallback((
+    title: string,
+    message: string,
+    actions: DialogAction[] = [{ text: "OK" }],
+    tone: DialogTone = "neutral",
+  ) => setAppDialog({ title, message, actions, tone }), []);
+
+  const selectTab = useCallback((next: Tab) => {
+    setTab(next);
+    pageScrollRef.current?.scrollTo({ y: 0, animated: false });
+  }, []);
+
+  const tabSwipeResponder = useMemo(() => {
+    const finishSwipe = (dx: number, dy: number, velocityX: number) => {
+      const horizontal = Math.abs(dx);
+      const vertical = Math.abs(dy);
+      const isDeliberateSwipe = horizontal >= 48 || (horizontal >= 28 && Math.abs(velocityX) >= 0.45);
+      if (!isDeliberateSwipe || horizontal <= vertical * 1.15) return;
+
+      const tabs: Tab[] = ["home", "activity", "insights"];
+      const current = tabs.indexOf(activeTabRef.current);
+      const next = dx < 0
+        ? Math.min(current + 1, tabs.length - 1)
+        : Math.max(current - 1, 0);
+      if (next !== current) selectTab(tabs[next]);
+    };
+
+    return PanResponder.create({
+      onMoveShouldSetPanResponderCapture: (_event, gesture) => {
+        const horizontal = Math.abs(gesture.dx);
+        const vertical = Math.abs(gesture.dy);
+        return horizontal >= 12 && horizontal > vertical * 1.15;
+      },
+      onPanResponderTerminationRequest: () => false,
+      onPanResponderRelease: (_event, gesture) => finishSwipe(gesture.dx, gesture.dy, gesture.vx),
+      onPanResponderTerminate: (_event, gesture) => finishSwipe(gesture.dx, gesture.dy, gesture.vx),
+      onShouldBlockNativeResponder: () => true,
+    });
+  }, [selectTab]);
+
+  const toggleTheme = useCallback(() => {
+    setThemeMode((current) => {
+      const next: ThemeMode = current === "light" ? "dark" : "light";
+      getDb()
+        .then((db) => db.runAsync("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", "theme_mode", next))
+        .catch(() => undefined);
+      return next;
+    });
+  }, []);
 
   const loadExpenses = useCallback(async () => {
     const db = await getDb();
@@ -323,7 +432,7 @@ function KharchaApp() {
       } catch (error) {
         // The recovery and pending files stay on disk. A later foreground
         // refresh retries them without preventing the wallet from opening.
-        console.warn("Kharcha native sync will retry", error);
+        console.warn("MoneySync native sync will retry", error);
       }
       await loadExpenses();
     })().finally(() => {
@@ -357,10 +466,32 @@ function KharchaApp() {
   }, []);
 
   useEffect(() => {
+    getDb()
+      .then((db) => db.getFirstAsync<{ value: ThemeMode }>("SELECT value FROM settings WHERE key = ?", "theme_mode"))
+      .then((saved) => {
+        if (saved?.value === "dark" || saved?.value === "light") setThemeMode(saved.value);
+      })
+      .catch(() => undefined);
+
     upgradeSmartCategories()
       .catch((error) => console.warn("Smart category upgrade will retry", error))
       .then(syncAndLoadExpenses)
-      .catch(() => Alert.alert("Couldn’t open your wallet", "Please restart the app and try again."))
+      .catch((error) => {
+        console.error("MoneySync wallet initialization failed", error);
+        showDialog(
+          "Couldn’t open your wallet",
+          "The wallet is temporarily busy. Your data is safe—tap Retry to open it again.",
+          [
+            { text: "Later", style: "cancel" },
+            {
+              text: "Retry",
+              onPress: () => syncAndLoadExpenses()
+                .catch(() => showDialog("Still busy", "Please wait a moment and pull down to refresh.", undefined, "warning")),
+            },
+          ],
+          "warning",
+        );
+      })
       .finally(() => setLoading(false));
 
     const responseSub = Notifications.addNotificationResponseReceivedListener((response) => {
@@ -378,7 +509,7 @@ function KharchaApp() {
       responseSub.remove();
       linkSub.remove();
     };
-  }, [syncAndLoadExpenses, upgradeSmartCategories]);
+  }, [showDialog, syncAndLoadExpenses, upgradeSmartCategories]);
 
   useEffect(() => {
     const subscription = AppState.addEventListener("change", (state) => {
@@ -405,22 +536,24 @@ function KharchaApp() {
     if (Platform.OS !== "android") return;
     const result = await PermissionsAndroid.request(PermissionsAndroid.PERMISSIONS.RECEIVE_SMS, {
       title: "Enable bank SMS capture",
-      message: "Kharcha will process new debit and credit alerts locally. OTPs and full message text are not stored.",
+      message: "MoneySync will process new debit and credit alerts locally. OTPs and full message text are not stored.",
       buttonPositive: "Allow",
       buttonNegative: "Cancel",
     });
     const enabled = result === PermissionsAndroid.RESULTS.GRANTED;
     setSmsEnabled(enabled);
-    Alert.alert(
+    showDialog(
       enabled ? "SMS capture is on" : "SMS permission is off",
       enabled ? "SMS and Gmail alerts now work together with duplicate protection." : "You can enable it later from this screen.",
+      undefined,
+      enabled ? "success" : "warning",
     );
   };
 
   const requestGmailAccess = () => {
-    Alert.alert(
+    showDialog(
       "Enable notification-bar capture",
-      "On the next screen, turn on notification access for Kharcha. It will detect PKR/Rs debit and credit alerts from Gmail, Messages, banking and wallet apps without storing the full notification text.",
+      "On the next screen, turn on notification access for MoneySync. It will detect PKR/Rs debit and credit alerts from Gmail, Messages, banking and wallet apps without storing the full notification text.",
       [
         { text: "Cancel", style: "cancel" },
         {
@@ -429,6 +562,7 @@ function KharchaApp() {
             .catch(() => Linking.openSettings()),
         },
       ],
+      "neutral",
     );
   };
 
@@ -436,9 +570,9 @@ function KharchaApp() {
     const result = await Notifications.requestPermissionsAsync();
     if (result.status === "granted") {
       await scheduleReports();
-      Alert.alert("Daily recap is on", "We’ll remind you at 8:30 PM each evening.");
+      showDialog("Daily recap is on", "We’ll remind you at 8:30 PM each evening.", undefined, "success");
     } else {
-      Alert.alert("Notifications are off", "You can enable them later in Android Settings.");
+      showDialog("Notifications are off", "You can enable them later in Android Settings.", undefined, "warning");
     }
   };
 
@@ -579,7 +713,7 @@ function KharchaApp() {
   const addEntry = async () => {
     const parsed = Number(amount.replace(/,/g, ""));
     if (!description.trim() || !Number.isFinite(parsed) || parsed <= 0) {
-      Alert.alert("Almost there", "Add a short description and a valid amount.");
+      showDialog("Almost there", "Add a short description and a valid amount.", undefined, "warning");
       return;
     }
     const entry: Expense = {
@@ -606,23 +740,27 @@ function KharchaApp() {
       setAmount("");
       Keyboard.dismiss();
     } catch {
-      Alert.alert("Couldn’t save entry", "Nothing was changed. Please try again.");
+      showDialog("Couldn’t save entry", "Nothing was changed. Please try again.", undefined, "danger");
     }
   };
 
   const removeEntry = (entry: Expense) => {
-    Alert.alert("Remove transaction?", entry.description, [
+    showDialog("Remove transaction?", entry.description, [
       { text: "Cancel", style: "cancel" },
       {
         text: "Remove",
         style: "destructive",
         onPress: async () => {
-          const db = await getDb();
-          await db.runAsync("DELETE FROM expenses WHERE id = ?", entry.id);
-          setExpenses((items) => items.filter((item) => item.id !== entry.id));
+          try {
+            const db = await getDb();
+            await db.runAsync("DELETE FROM expenses WHERE id = ?", entry.id);
+            setExpenses((items) => items.filter((item) => item.id !== entry.id));
+          } catch {
+            showDialog("Couldn’t remove entry", "Nothing was changed. Please try again.", undefined, "danger");
+          }
         },
       },
-    ]);
+    ], "danger");
   };
 
   const openEditor = (entry: Expense) => {
@@ -637,7 +775,7 @@ function KharchaApp() {
     if (!editingExpense) return;
     const parsed = Number(editAmount.replace(/,/g, ""));
     if (!editDescription.trim() || !Number.isFinite(parsed) || parsed <= 0) {
-      Alert.alert("Almost there", "Add a description and a valid amount.");
+      showDialog("Almost there", "Add a description and a valid amount.", undefined, "warning");
       return;
     }
     const updated: Expense = {
@@ -661,13 +799,13 @@ function KharchaApp() {
       setEditingExpense(null);
       Keyboard.dismiss();
     } catch {
-      Alert.alert("Couldn’t update entry", "Nothing was changed. Please try again.");
+      showDialog("Couldn’t update entry", "Nothing was changed. Please try again.", undefined, "danger");
     }
   };
 
   const exportCsv = async () => {
     if (!expenses.length) {
-      Alert.alert("Nothing to export yet", "Add your first transaction, then try again.");
+      showDialog("Nothing to export yet", "Add your first transaction, then try again.", undefined, "warning");
       return;
     }
     const rows = [
@@ -675,9 +813,9 @@ function KharchaApp() {
       ...expenses.map((item) => [item.createdAt, item.description, item.category, item.type, String(item.amount)]),
     ];
     const csv = rows.map((row) => row.map((cell) => `"${cell.replaceAll('"', '""')}"`).join(",")).join("\n");
-    const uri = `${FileSystem.cacheDirectory}kharcha-expenses.csv`;
+    const uri = `${FileSystem.cacheDirectory}moneysync-expenses.csv`;
     await FileSystem.writeAsStringAsync(uri, csv, { encoding: FileSystem.EncodingType.UTF8 });
-    await Sharing.shareAsync(uri, { mimeType: "text/csv", dialogTitle: "Export Kharcha expenses" });
+    await Sharing.shareAsync(uri, { mimeType: "text/csv", dialogTitle: "Export MoneySync expenses" });
   };
 
   const onRefresh = async () => {
@@ -705,117 +843,77 @@ function KharchaApp() {
   };
 
   return (
-    <SafeAreaView style={styles.safe} edges={["top", "left", "right"]}>
-      <StatusBar style="light" />
-      <KeyboardAvoidingView behavior={Platform.OS === "ios" ? "padding" : undefined} style={styles.flex}>
-        <ScrollView
-          contentContainerStyle={styles.scroll}
+    <SafeAreaView style={[styles.safe, tab === "home" && styles.homeSafe]} edges={["top", "left", "right"]}>
+      <StatusBar style={themeMode === "dark" ? "light" : "dark"} />
+      <KeyboardAvoidingView
+        behavior={Platform.OS === "ios" ? "padding" : undefined}
+        style={styles.flex}
+        {...tabSwipeResponder.panHandlers}
+      >
+        <Animated.ScrollView
+          ref={pageScrollRef}
+          contentContainerStyle={[styles.scroll, tab === "home" && styles.homeScroll]}
           keyboardShouldPersistTaps="handled"
+          scrollEventThrottle={16}
+          onScroll={tab === "home" ? Animated.event(
+            [{ nativeEvent: { contentOffset: { y: homeScrollY } } }],
+            { useNativeDriver: false },
+          ) : undefined}
           refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} tintColor={COLORS.purple} />}
         >
-          <View style={styles.header}>
-            <View style={styles.brandLockup}>
-              <LinearGradient colors={["#7D6CF0", "#5944CC"]} style={styles.brandMark}>
-                <Ionicons name="wallet-outline" size={21} color="#FFF" />
-              </LinearGradient>
-              <View>
-                <Text style={styles.logo}>Kharcha<Text style={styles.logoDot}>.</Text></Text>
-                <Text style={styles.tagline}>PERSONAL FINANCE</Text>
+          {tab !== "home" && (
+            <View style={styles.header}>
+              <View style={styles.brandLockup}>
+                <Image source={require("./assets/icon.png")} style={styles.brandMark} />
+                <View>
+                  <Text style={styles.logo}>MoneySync<Text style={styles.logoDot}>.</Text></Text>
+                  <Text style={styles.tagline}>PERSONAL FINANCE</Text>
+                </View>
+              </View>
+              <View style={styles.headerActions}>
+                <Pressable onPress={toggleTheme} style={styles.headerButton}><Ionicons name={themeMode === "dark" ? "sunny-outline" : "moon-outline"} size={19} color={themeMode === "dark" ? "#F4F5F2" : COLORS.ink} /></Pressable>
+                <Pressable onPress={requestDailyReports} style={styles.headerButton}><Ionicons name="notifications-outline" size={19} color={themeMode === "dark" ? "#F4F5F2" : COLORS.ink} /></Pressable>
+                <Pressable onPress={exportCsv} style={styles.headerButton}><Ionicons name="share-outline" size={20} color={themeMode === "dark" ? "#F4F5F2" : COLORS.ink} /></Pressable>
               </View>
             </View>
-            <View style={styles.headerActions}>
-              <Pressable onPress={requestDailyReports} style={styles.headerButton}><Ionicons name="notifications-outline" size={19} color={COLORS.ink} /></Pressable>
-              <Pressable onPress={exportCsv} style={styles.headerButton}><Ionicons name="share-outline" size={20} color={COLORS.ink} /></Pressable>
-            </View>
-          </View>
+          )}
 
           {tab === "home" && (
             <>
-              <LinearGradient colors={["#3B2A79", "#21153F"]} start={{ x: 0, y: 0 }} end={{ x: 1, y: 1 }} style={styles.moneyHero}>
-                <View style={styles.heroOrbLarge} />
-                <View style={styles.heroOrbSmall} />
-                <View style={styles.heroTop}>
-                  <Pressable onPress={() => setOverviewSelectorVisible(true)} style={styles.heroPill}>
-                    <View style={styles.heroLiveDot} />
-                    <Text style={styles.heroPillText}>{overviewLabel} OVERVIEW</Text>
-                    <Ionicons name="chevron-down" size={11} color="#655D70" />
-                  </Pressable>
-                  <Text numberOfLines={1} style={styles.heroMonth}>{overviewPeriod}</Text>
-                </View>
-                <Text style={styles.heroBalanceLabel}>Net position</Text>
-                <Text numberOfLines={1} adjustsFontSizeToFit style={styles.heroBalance}>{money(overviewTotals.balance)}</Text>
-                <Text style={styles.heroBalanceCaption}>Money in minus money out for this overview</Text>
-                <View style={styles.heroDivider} />
-                <View style={styles.heroStats}>
-                  <View style={styles.heroStat}>
-                    <Text style={styles.heroStatLabel}>ENTRIES</Text>
-                    <Text style={styles.heroStatValue}>{overviewExpenses.length}</Text>
-                  </View>
-                  <View style={styles.heroStatDivider} />
-                  <View style={styles.heroStat}>
-                    <Text style={styles.heroStatLabel}>MONEY IN</Text>
-                    <Text style={[styles.heroStatValue, { color: "#78E2B6" }]}>{shortMoney(overviewTotals.credits)}</Text>
-                  </View>
-                  <View style={styles.heroStatDivider} />
-                  <View style={styles.heroStat}>
-                    <Text style={styles.heroStatLabel}>MONEY OUT</Text>
-                    <Text style={[styles.heroStatValue, { color: "#FFB0A1" }]}>{shortMoney(overviewTotals.debits)}</Text>
-                  </View>
-                </View>
-              </LinearGradient>
-
-              <View style={styles.greeting}>
-                <View>
-                  <Text style={styles.eyebrow}>YOUR MONEY, AT A GLANCE</Text>
-                  <Text style={styles.title}>Good {new Date().getHours() < 12 ? "morning" : new Date().getHours() < 18 ? "afternoon" : "evening"} 👋</Text>
-                  <Text style={styles.subtitle}>Capture it now. Understand it later.</Text>
-                </View>
-                <View style={styles.todayBadge}>
-                  <Text style={styles.todayLabel}>TODAY</Text>
-                  <Text style={styles.todayValue}>{shortMoney(todayTotal)}</Text>
-                </View>
-              </View>
-
-              <LinearGradient colors={["#24202F", "#191720"]} style={styles.quickCard}>
+              <View style={styles.homeSheet}>
                 <View style={styles.quickHeader}>
-                  <LinearGradient colors={["#816CF5", "#5B46D5"]} style={styles.bolt}>
-                    <Ionicons name="flash" size={17} color="#FFF" />
-                  </LinearGradient>
                   <View style={styles.quickHeading}>
-                    <Text style={styles.quickEyebrow}>FAST CAPTURE</Text>
                     <Text style={styles.quickTitle}>Quick add</Text>
-                    <Text style={styles.quickSubtitle}>Two fields. Done in seconds.</Text>
+                    <Text style={styles.quickSubtitle}>A transaction in two taps</Text>
                   </View>
-                  <View style={styles.quickReady}>
-                    <View style={styles.quickReadyDot} />
-                    <Text style={styles.quickReadyText}>READY</Text>
+                  <View style={styles.todayMiniBadge}>
+                    <Text style={styles.todayMiniLabel}>TODAY</Text>
+                    <Text style={styles.todayMiniValue}>{shortMoney(todayTotal)}</Text>
                   </View>
                 </View>
                 <View style={styles.typeToggle}>
                   <Pressable onPress={() => setEntryType("debit")} style={[styles.typeButton, entryType === "debit" && styles.typeButtonDebit]}>
-                    <Ionicons name="arrow-up-outline" size={13} color={entryType === "debit" ? "#FFF" : "#8E8799"} />
-                    <Text style={[styles.typeText, entryType === "debit" && styles.typeTextSelected]}>MONEY OUT</Text>
+                    <Ionicons name="arrow-up-outline" size={13} color={entryType === "debit" ? "#FFF" : "#77736F"} />
+                    <Text style={[styles.typeText, entryType === "debit" && styles.typeTextSelected]}>Expense</Text>
                   </Pressable>
                   <Pressable onPress={() => setEntryType("credit")} style={[styles.typeButton, entryType === "credit" && styles.typeButtonCredit]}>
-                    <Ionicons name="arrow-down-outline" size={13} color={entryType === "credit" ? "#FFF" : "#8E8799"} />
-                    <Text style={[styles.typeText, entryType === "credit" && styles.typeTextSelected]}>MONEY IN</Text>
+                    <Ionicons name="arrow-down-outline" size={13} color={entryType === "credit" ? "#0B0B0B" : "#77736F"} />
+                    <Text style={[styles.typeText, entryType === "credit" && styles.typeTextSelected, entryType === "credit" && styles.typeTextCreditSelected]}>Income</Text>
                   </Pressable>
                 </View>
-                <Text style={styles.quickFieldLabel}>DESCRIPTION</Text>
                 <View style={styles.descriptionWrap}>
-                  <Ionicons name="create-outline" size={17} color="#9B91B1" />
+                  <Ionicons name="create-outline" size={17} color="#706B67" />
                   <TextInput
                     ref={descriptionRef}
                     value={description}
                     onChangeText={setDescription}
                     onSubmitEditing={() => amountRef.current?.focus()}
                     returnKeyType="next"
-                    placeholder="What was it?"
-                    placeholderTextColor="#777180"
+                    placeholder="e.g. Lunch, fuel or rent"
+                    placeholderTextColor="#9A9590"
                     style={styles.descriptionInput}
                   />
                 </View>
-                <Text style={styles.quickFieldLabel}>AMOUNT</Text>
                 <View style={styles.amountRow}>
                   <View style={styles.amountInputWrap}>
                     <View style={styles.currencyBadge}><Text style={styles.currency}>Rs</Text></View>
@@ -827,73 +925,61 @@ function KharchaApp() {
                       returnKeyType="done"
                       keyboardType="decimal-pad"
                       placeholder="0"
-                      placeholderTextColor="#918C98"
+                      placeholderTextColor="#9A9590"
                       style={styles.amountInput}
                     />
                   </View>
                   <Pressable onPress={addEntry} style={styles.addButton}>
-                    <Text style={styles.addButtonText}>{entryType === "credit" ? "Add income" : "Add expense"}</Text>
+                    <Text style={styles.addButtonText}>Add</Text>
                     <Ionicons name="arrow-forward" size={16} color="#FFF" />
                   </Pressable>
                 </View>
-                <View style={styles.hintRow}>
-                  <Ionicons name="sparkles-outline" size={12} color="#A997FF" />
-                  <Text style={styles.hint}>Category is detected automatically</Text>
-                </View>
-              </LinearGradient>
 
-              <View style={styles.statsRow}>
-                <View style={styles.statCard}>
-                  <View style={[styles.statIcon, { backgroundColor: "#292341" }]}><Ionicons name="wallet-outline" size={18} color={COLORS.purple} /></View>
-                  <Text style={styles.statLabel}>BALANCE</Text>
-                  <Text style={styles.statValue}>{shortMoney(totals.balance)}</Text>
-                  <Text style={styles.statFoot}>Credits − spending</Text>
+                <View style={styles.homeSectionTop}>
+                  <Text style={styles.homeSectionTitle}>Top categories</Text>
+                  <Pressable onPress={() => setTab("insights")}><Text style={styles.homeSectionAction}>View insights</Text></Pressable>
                 </View>
-                <View style={styles.statCard}>
-                  <View style={[styles.statIcon, { backgroundColor: "#35221F" }]}><Ionicons name="arrow-up-outline" size={18} color={COLORS.coral} /></View>
-                  <Text style={styles.statLabel}>SPENT</Text>
-                  <Text style={styles.statValue}>{shortMoney(totals.debits)}</Text>
-                  <Text style={styles.statFoot}>This month</Text>
+                <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.homeCategoryRow}>
+                  {(categories.length ? categories.slice(0, 3) : [
+                    { name: "Food", value: 0 },
+                    { name: "Transport", value: 0 },
+                    { name: "Bills", value: 0 },
+                  ]).map((item, index) => {
+                    const meta = categoryMeta[item.name] ?? categoryMeta.Other;
+                    return (
+                      <View key={item.name} style={[styles.homeCategoryCard, index === 1 && styles.homeCategoryCardLilac, index === 2 && styles.homeCategoryCardMint]}>
+                        <View style={styles.homeCategoryIcon}><Ionicons name={meta.icon} size={17} color="#111" /></View>
+                        <Text numberOfLines={1} style={styles.homeCategoryName}>{item.name}</Text>
+                        <Text numberOfLines={1} style={styles.homeCategoryValue}>{shortMoney(item.value)}</Text>
+                      </View>
+                    );
+                  })}
+                </ScrollView>
+
+                <View style={styles.homeSectionTop}>
+                  <View>
+                    <Text style={styles.homeSectionTitle}>Recent activity</Text>
+                    <Text style={styles.homeSectionCaption}>Tap an entry to edit it</Text>
+                  </View>
+                  <Pressable onPress={() => setTab("activity")}><Ionicons name="arrow-forward" size={18} color="#111" /></Pressable>
+                </View>
+                <View style={styles.homeList}>
+                  {expenses.slice(0, 5).map((item) => {
+                    const meta = categoryMeta[item.category] ?? categoryMeta.Other;
+                    return (
+                      <Pressable key={item.id} onPress={() => openEditor(item)} onLongPress={() => removeEntry(item)} style={styles.homeTransaction}>
+                        <View style={[styles.homeTransactionIcon, { backgroundColor: `${meta.color}22` }]}><Ionicons name={meta.icon} color={meta.color} size={17} /></View>
+                        <View style={styles.transactionText}>
+                          <Text numberOfLines={1} style={styles.homeTransactionTitle}>{item.description}</Text>
+                          <Text style={styles.homeTransactionMeta}>{item.category} · {new Date(item.createdAt).toLocaleDateString("en-PK", { day: "numeric", month: "short" })}</Text>
+                        </View>
+                        <Text style={[styles.homeTransactionAmount, item.type === "credit" && styles.homeCreditAmount]}>{item.type === "credit" ? "+" : "−"} {money(item.amount)}</Text>
+                      </Pressable>
+                    );
+                  })}
+                  {!expenses.length && <Text style={styles.homeEmpty}>Your first transaction will appear here.</Text>}
                 </View>
               </View>
-
-              <LinearGradient colors={["#6B59DB", "#5140BE"]} style={styles.recapCard}>
-                <View style={styles.recapHeader}>
-                  <View style={styles.recapSpark}><Ionicons name="sparkles" size={18} color="#FFE18C" /></View>
-                  <View style={styles.flex}><Text style={styles.recapEyebrow}>DAILY RECAP</Text><Text style={styles.recapTitle}>Today, in a nutshell</Text></View>
-                  <Pressable onPress={requestDailyReports}><Ionicons name="notifications-outline" size={22} color="#FFF" /></Pressable>
-                </View>
-                <Text style={styles.recapLabel}>You spent</Text>
-                <Text style={styles.recapAmount}>{money(todayTotal)}</Text>
-                <View style={styles.recapInsight}>
-                  <Ionicons name="bulb-outline" size={18} color="#FFD978" />
-                  <Text style={styles.recapInsightText}>
-                    <Text style={styles.recapStrong}>{categories[0]?.name ?? "Your top category"} leads this month. </Text>
-                    {categories[0] ? `${Math.round((categories[0].value / Math.max(totals.debits, 1)) * 100)}% of your spending went there.` : "Add a few entries and Kharcha will spot your pattern."}
-                  </Text>
-                </View>
-              </LinearGradient>
-
-              <View style={styles.smartInsight}>
-                <LinearGradient colors={["#33265F", "#28203E"]} style={styles.smartInsightIcon}>
-                  <Ionicons name="sparkles" size={19} color="#D5CBFF" />
-                </LinearGradient>
-                <View style={styles.flex}>
-                  <Text style={styles.smartInsightLabel}>SMART SPENDING SIGNAL</Text>
-                  <Text style={styles.smartInsightTitle}>
-                    {categories[0] ? `${categories[0].name} is your leading category` : "Your pattern will appear here"}
-                  </Text>
-                  <Text style={styles.smartInsightCopy}>
-                    {categories[0] ? `${Math.round((categories[0].value / Math.max(totals.debits, 1)) * 100)}% of this month’s spending · ${money(categories[0].value)}` : "Add a few transactions and Kharcha will summarize the pattern."}
-                  </Text>
-                </View>
-                <Pressable onPress={() => setTab("insights")} style={styles.smartInsightArrow}>
-                  <Ionicons name="arrow-forward" size={17} color="#C5BBFF" />
-                </Pressable>
-              </View>
-
-              <SectionHeader eyebrow="LATEST ACTIVITY" title="Recent transactions" action="See all" onAction={() => setTab("activity")} />
-              <View style={styles.listCard}>{expenses.slice(0, 5).map(renderTransaction)}</View>
             </>
           )}
 
@@ -983,7 +1069,7 @@ function KharchaApp() {
                 </View>
               </View>
 
-              <LinearGradient colors={["#503CC0", "#2A1D60", "#191522"]} locations={[0, .62, 1]} style={styles.insightHero}>
+              <LinearGradient colors={["#090909", "#151515", "#211D24"]} locations={[0, .62, 1]} style={styles.insightHero}>
                 <View style={styles.insightOrbLarge} />
                 <View style={styles.insightOrbSmall} />
                 <View style={styles.insightHeroTop}>
@@ -1074,7 +1160,7 @@ function KharchaApp() {
                       <View key={item.key} style={styles.weekColumn}>
                         <Text numberOfLines={1} style={styles.weekValue}>{item.value ? shortMoney(item.value).replace("Rs ", "") : "—"}</Text>
                         <View style={styles.weekBarSlot}>
-                          <LinearGradient colors={item.value ? ["#8B75FF", "#5E49D8"] : ["#2D2935", "#2D2935"]} style={[styles.weekBar, { height }]} />
+                          <LinearGradient colors={item.value ? ["#B29DCE", "#846DA9"] : ["#E5E0DA", "#E5E0DA"]} style={[styles.weekBar, { height }]} />
                         </View>
                         <Text style={styles.weekLabel}>{item.label}</Text>
                       </View>
@@ -1139,34 +1225,34 @@ function KharchaApp() {
 
               <View style={styles.metricGrid}>
                 <View style={styles.metricCard}>
-                  <View style={[styles.metricIcon, { backgroundColor: "#28223E" }]}><Ionicons name="speedometer-outline" size={18} color={COLORS.purple} /></View>
+                  <View style={[styles.metricIcon, { backgroundColor: "#E8E2F2" }]}><Ionicons name="speedometer-outline" size={18} color={COLORS.purple} /></View>
                   <Text style={styles.metricLabel}>DAILY AVERAGE</Text>
                   <Text style={styles.metricValue}>{shortMoney(insightMetrics.average)}</Text>
                 </View>
                 <View style={styles.metricCard}>
-                  <View style={[styles.metricIcon, { backgroundColor: "#35221F" }]}><Ionicons name="flash-outline" size={18} color={COLORS.coral} /></View>
+                  <View style={[styles.metricIcon, { backgroundColor: "#F3E2DE" }]}><Ionicons name="flash-outline" size={18} color={COLORS.coral} /></View>
                   <Text style={styles.metricLabel}>LARGEST SPEND</Text>
                   <Text style={styles.metricValue}>{shortMoney(insightMetrics.largest)}</Text>
                 </View>
                 <View style={styles.metricCard}>
-                  <View style={[styles.metricIcon, { backgroundColor: "#1A2B25" }]}><Ionicons name="calendar-outline" size={18} color={COLORS.green} /></View>
+                  <View style={[styles.metricIcon, { backgroundColor: "#DCEDE7" }]}><Ionicons name="calendar-outline" size={18} color={COLORS.green} /></View>
                   <Text style={styles.metricLabel}>SPENDING DAYS</Text>
                   <Text style={styles.metricValue}>{insightMetrics.activeDays}</Text>
                 </View>
                 <View style={styles.metricCard}>
-                  <View style={[styles.metricIcon, { backgroundColor: "#2B2419" }]}><Ionicons name="trending-up-outline" size={18} color={COLORS.gold} /></View>
+                  <View style={[styles.metricIcon, { backgroundColor: "#F3E9D6" }]}><Ionicons name="trending-up-outline" size={18} color={COLORS.gold} /></View>
                   <Text style={styles.metricLabel}>SAVINGS RATE</Text>
                   <Text style={[styles.metricValue, { color: insightMetrics.savingsRate >= 0 ? COLORS.green : COLORS.coral }]}>{Math.round(insightMetrics.savingsRate)}%</Text>
                 </View>
               </View>
 
               <View style={styles.monthCards}>
-                <View style={[styles.monthCard, { backgroundColor: "#142820" }]}>
+                <View style={[styles.monthCard, { backgroundColor: "#DCEDE7" }]}>
                   <Ionicons name="arrow-down-circle-outline" size={23} color={COLORS.green} />
                   <Text style={styles.monthCardLabel}>TOTAL CREDIT</Text>
                   <Text style={styles.monthCardValue}>{money(totals.credits)}</Text>
                 </View>
-                <View style={[styles.monthCard, { backgroundColor: "#30201D" }]}>
+                <View style={[styles.monthCard, { backgroundColor: "#F3E2DE" }]}>
                   <Ionicons name="arrow-up-circle-outline" size={23} color={COLORS.coral} />
                   <Text style={styles.monthCardLabel}>TOTAL DEBIT</Text>
                   <Text style={styles.monthCardValue}>{money(totals.debits)}</Text>
@@ -1180,7 +1266,7 @@ function KharchaApp() {
               </Pressable>
 
               <Pressable onPress={requestGmailAccess} style={styles.notificationCard}>
-                <View style={[styles.notificationIcon, { backgroundColor: "#1A2B25" }]}><Ionicons name="chatbox-ellipses-outline" size={21} color={COLORS.green} /></View>
+                <View style={[styles.notificationIcon, { backgroundColor: "#DCEDE7" }]}><Ionicons name="chatbox-ellipses-outline" size={21} color={COLORS.green} /></View>
                 <View style={styles.flex}>
                   <Text style={styles.notificationTitle}>Notification-bar money capture</Text>
                   <Text style={styles.notificationCopy}>Gmail, Messages, banking and wallet alerts are checked locally.</Text>
@@ -1189,7 +1275,7 @@ function KharchaApp() {
               </Pressable>
 
               <Pressable onPress={requestSmsAccess} style={styles.notificationCard}>
-                <View style={[styles.notificationIcon, { backgroundColor: "#2B2419" }]}><Ionicons name="chatbubble-outline" size={21} color={COLORS.gold} /></View>
+                <View style={[styles.notificationIcon, { backgroundColor: "#F3E9D6" }]}><Ionicons name="chatbubble-outline" size={21} color={COLORS.gold} /></View>
                 <View style={styles.flex}>
                   <Text style={styles.notificationTitle}>Bank SMS backup capture</Text>
                   <Text style={styles.notificationCopy}>{smsEnabled ? "On · Works alongside Gmail with duplicate protection." : "Off · Tap to enable SMS monitoring."}</Text>
@@ -1198,8 +1284,132 @@ function KharchaApp() {
               </Pressable>
             </>
           )}
-        </ScrollView>
+        </Animated.ScrollView>
       </KeyboardAvoidingView>
+
+      {tab === "home" && (
+        <Animated.View
+          key={`home-top-shell-${themeMode}`}
+          style={[
+            baseStyles.homeTopShell,
+            themeMode === "dark"
+              ? { backgroundColor: "#202622", borderColor: "#3A453E", shadowOpacity: .42 }
+              : { backgroundColor: "#090909", borderColor: "#090909", shadowOpacity: .18 },
+            {
+              top: insets.top + 8,
+              height: homeHeaderHeight,
+              borderRadius: homeHeaderRadius,
+            },
+          ]}
+        >
+          <View style={[baseStyles.homeOrbitLarge, themeMode === "dark" && { borderColor: "#B8A7D52E" }]} />
+          <View style={[baseStyles.homeOrbitSmall, themeMode === "dark" && { borderColor: "#9ED8C63D" }]} />
+
+          <Animated.View style={[baseStyles.homeHeader, { opacity: expandedHeaderOpacity }]}>
+            <View style={baseStyles.homeBrand}>
+              <Image source={require("./assets/icon.png")} style={baseStyles.homeBrandMark} />
+              <Text style={baseStyles.homeLogo}>MoneySync.</Text>
+            </View>
+            <View style={baseStyles.homeHeaderActions}>
+              <Pressable onPress={toggleTheme} style={[baseStyles.homeRoundButton, themeMode === "dark" && { backgroundColor: "#FFFFFF0D", borderColor: "#FFFFFF24" }]}><Ionicons name={themeMode === "dark" ? "sunny-outline" : "moon-outline"} size={17} color="#F8F7F3" /></Pressable>
+              <Pressable onPress={requestDailyReports} style={[baseStyles.homeRoundButton, themeMode === "dark" && { backgroundColor: "#FFFFFF0D", borderColor: "#FFFFFF24" }]}><Ionicons name="notifications-outline" size={17} color="#F8F7F3" /></Pressable>
+              <Pressable onPress={exportCsv} style={[baseStyles.homeRoundButton, themeMode === "dark" && { backgroundColor: "#FFFFFF0D", borderColor: "#FFFFFF24" }]}><Ionicons name="share-outline" size={17} color="#F8F7F3" /></Pressable>
+            </View>
+          </Animated.View>
+
+          <Animated.View style={[baseStyles.homeHeroSelector, { opacity: expandedHeaderOpacity }]}>
+            <Pressable onPress={() => setOverviewSelectorVisible(true)} style={[baseStyles.heroPill, themeMode === "dark" && { backgroundColor: "#FFFFFF0D", borderColor: "#FFFFFF20" }]}>
+              <View style={baseStyles.heroLiveDot} />
+              <Text style={baseStyles.heroPillText}>{overviewLabel}</Text>
+              <Ionicons name="chevron-down" size={11} color="#ECE9E2" />
+            </Pressable>
+            <Text numberOfLines={1} style={baseStyles.heroMonth}>{overviewPeriod}</Text>
+          </Animated.View>
+
+          <Animated.View style={[baseStyles.homeBalanceBlock, { top: homeBalanceTop }]}>
+            <View style={baseStyles.homeBalanceLabelStack}>
+              <Animated.Text style={[baseStyles.heroBalanceLabel, baseStyles.homeExpandedBalanceLabel, { opacity: expandedHeaderOpacity }]}>Your net position</Animated.Text>
+              <Animated.Text style={[baseStyles.compactBalanceLabel, baseStyles.homeCollapsedBalanceLabel, { opacity: collapsedHeaderOpacity }]}>{overviewLabel} BALANCE</Animated.Text>
+            </View>
+            <Text numberOfLines={1} adjustsFontSizeToFit style={baseStyles.heroBalance}>{money(overviewTotals.balance)}</Text>
+            <Animated.Text style={[baseStyles.heroBalanceCaption, { opacity: expandedHeaderOpacity }]}>Updated from {overviewExpenses.length} transaction{overviewExpenses.length === 1 ? "" : "s"}</Animated.Text>
+          </Animated.View>
+
+          <Animated.View style={[baseStyles.heroStats, baseStyles.homeHeroStats, themeMode === "dark" && { backgroundColor: "#0B0E0C66", borderWidth: 1, borderColor: "#FFFFFF12" }, { opacity: expandedHeaderOpacity }]}>
+            <View style={baseStyles.heroStat}>
+              <Text style={baseStyles.heroStatLabel}>MONEY IN</Text>
+              <Text style={baseStyles.heroStatValue}>{shortMoney(overviewTotals.credits)}</Text>
+            </View>
+            <View style={baseStyles.heroStatDivider} />
+            <View style={baseStyles.heroStat}>
+              <Text style={baseStyles.heroStatLabel}>MONEY OUT</Text>
+              <Text style={baseStyles.heroStatValue}>{shortMoney(overviewTotals.debits)}</Text>
+            </View>
+          </Animated.View>
+
+          <Animated.View pointerEvents="none" style={[baseStyles.compactBalanceMark, themeMode === "dark" && { backgroundColor: "#A9D9CA" }, { opacity: collapsedHeaderOpacity }]}>
+            <Ionicons name="wallet-outline" size={18} color="#0B0B0B" />
+          </Animated.View>
+        </Animated.View>
+      )}
+
+      <Modal
+        animationType="fade"
+        transparent
+        visible={Boolean(appDialog)}
+        onRequestClose={() => setAppDialog(null)}
+      >
+        <View style={styles.appDialogBackdrop}>
+          <Pressable style={StyleSheet.absoluteFill} onPress={() => setAppDialog(null)} />
+          {appDialog && (() => {
+            const tone = DIALOG_TONES[appDialog.tone];
+            return (
+              <View style={styles.appDialogCard}>
+                <View style={[styles.appDialogIcon, { backgroundColor: tone.background }]}>
+                  <Ionicons name={tone.icon} size={24} color={tone.color} />
+                </View>
+                <Text style={styles.appDialogTitle}>{appDialog.title}</Text>
+                <Text style={styles.appDialogMessage}>{appDialog.message}</Text>
+                <View style={styles.appDialogActions}>
+                  {appDialog.actions.map((action, index) => {
+                    const isCancel = action.style === "cancel";
+                    const isDanger = action.style === "destructive";
+                    return (
+                      <Pressable
+                        key={`${action.text}-${index}`}
+                        onPress={() => {
+                          const callback = action.onPress;
+                          setAppDialog(null);
+                          if (callback) {
+                            setTimeout(() => {
+                              Promise.resolve(callback()).catch(() => showDialog(
+                                "Something went wrong",
+                                "Please try again.",
+                                undefined,
+                                "danger",
+                              ));
+                            }, 160);
+                          }
+                        }}
+                        style={[
+                          styles.appDialogButton,
+                          isCancel && styles.appDialogButtonCancel,
+                          isDanger && styles.appDialogButtonDanger,
+                        ]}
+                      >
+                        <Text style={[
+                          styles.appDialogButtonText,
+                          isCancel && styles.appDialogButtonTextCancel,
+                        ]}>{action.text}</Text>
+                      </Pressable>
+                    );
+                  })}
+                </View>
+              </View>
+            );
+          })()}
+        </View>
+      </Modal>
 
       <Modal
         animationType="fade"
@@ -1368,7 +1578,7 @@ function KharchaApp() {
                 <Text style={[styles.editorTypeText, editType === "debit" && styles.editorTypeTextActive]}>SPEND</Text>
               </Pressable>
               <Pressable onPress={() => setEditType("credit")} style={[styles.editorTypeButton, editType === "credit" && styles.editorCredit]}>
-                <Text style={[styles.editorTypeText, editType === "credit" && styles.editorTypeTextActive]}>CREDIT</Text>
+                <Text style={[styles.editorTypeText, editType === "credit" && styles.editorTypeTextActive, editType === "credit" && styles.editorTypeTextCreditActive]}>CREDIT</Text>
               </Pressable>
             </View>
 
@@ -1434,10 +1644,10 @@ function KharchaApp() {
         </KeyboardAvoidingView>
       </Modal>
 
-      <View style={styles.tabBar}>
-        <TabButton icon="home" label="Home" active={tab === "home"} onPress={() => setTab("home")} />
-        <TabButton icon="receipt-outline" label="Activity" active={tab === "activity"} onPress={() => setTab("activity")} />
-        <TabButton icon="pie-chart-outline" label="Insights" active={tab === "insights"} onPress={() => setTab("insights")} />
+      <View style={[styles.tabBar, styles.homeTabBar]}>
+        <TabButton icon="home" label="Home" active={tab === "home"} light={!activeThemeDark} onPress={() => selectTab("home")} />
+        <TabButton icon="receipt-outline" label="Activity" active={tab === "activity"} light={!activeThemeDark} onPress={() => selectTab("activity")} />
+        <TabButton icon="pie-chart-outline" label="Insights" active={tab === "insights"} light={!activeThemeDark} onPress={() => selectTab("insights")} />
       </View>
     </SafeAreaView>
   );
@@ -1460,28 +1670,30 @@ function SectionHeader({ eyebrow, title, action, onAction }: { eyebrow: string; 
   );
 }
 
-function TabButton({ icon, label, active, onPress }: { icon: keyof typeof Ionicons.glyphMap; label: string; active: boolean; onPress: () => void }) {
+function TabButton({ icon, label, active, light = false, onPress }: { icon: keyof typeof Ionicons.glyphMap; label: string; active: boolean; light?: boolean; onPress: () => void }) {
   return (
     <Pressable onPress={onPress} style={styles.tabButton}>
-      <Ionicons name={icon} size={22} color={active ? COLORS.purple : "#97939C"} />
-      <Text style={[styles.tabText, active && styles.tabTextActive]}>{label}</Text>
+      <Ionicons name={icon} size={22} color={active ? (light ? "#111111" : COLORS.purple) : "#97939C"} />
+      <Text style={[styles.tabText, active && styles.tabTextActive, light && active && styles.homeTabTextActive]}>{label}</Text>
       {active && <View style={styles.tabDot} />}
     </Pressable>
   );
 }
 
-const styles = StyleSheet.create({
+const baseStyles = StyleSheet.create({
   safe: { flex: 1, backgroundColor: COLORS.cream },
+  homeSafe: { backgroundColor: "#F4F1EE" },
   flex: { flex: 1 },
-  scroll: { paddingHorizontal: 20, paddingTop: 14, paddingBottom: 110 },
-  header: { flexDirection: "row", alignItems: "center", justifyContent: "space-between", marginBottom: 20 },
+  scroll: { paddingHorizontal: 18, paddingTop: 12, paddingBottom: 104 },
+  homeScroll: { paddingTop: 334 },
+  header: { flexDirection: "row", alignItems: "center", justifyContent: "space-between", marginBottom: 16 },
   brandLockup: { flexDirection: "row", alignItems: "center", gap: 11 },
-  brandMark: { width: 44, height: 44, borderRadius: 14, alignItems: "center", justifyContent: "center", shadowColor: "#6F5AE6", shadowOpacity: .28, shadowRadius: 12, elevation: 7 },
+  brandMark: { width: 40, height: 40, borderRadius: 12, alignItems: "center", justifyContent: "center" },
   logo: { fontSize: 21, fontWeight: "900", color: COLORS.ink, letterSpacing: -.8 },
   logoDot: { color: COLORS.coral },
   tagline: { color: COLORS.muted, fontSize: 7.5, fontWeight: "900", letterSpacing: 1.05, marginTop: 1 },
   headerActions: { flexDirection: "row", alignItems: "center", gap: 8 },
-  headerButton: { width: 40, height: 40, borderRadius: 13, backgroundColor: COLORS.paper, borderWidth: 1, borderColor: COLORS.line, alignItems: "center", justifyContent: "center" },
+  headerButton: { width: 38, height: 38, borderRadius: 12, backgroundColor: COLORS.paper, borderWidth: 1, borderColor: COLORS.line, alignItems: "center", justifyContent: "center" },
   previewPill: { height: 29, borderRadius: 20, backgroundColor: "#FFF3DD", borderWidth: 1, borderColor: "#EFD8AE", paddingHorizontal: 9, flexDirection: "row", alignItems: "center", gap: 4 },
   previewText: { color: "#8A5E16", fontSize: 8, fontWeight: "900", letterSpacing: .6 },
   greeting: { display: "none" },
@@ -1491,51 +1703,92 @@ const styles = StyleSheet.create({
   todayBadge: { alignItems: "flex-end", borderLeftWidth: 1, borderLeftColor: COLORS.line, paddingLeft: 14 },
   todayLabel: { color: "#99938B", fontSize: 8, fontWeight: "900", letterSpacing: .8 },
   todayValue: { fontSize: 16, fontWeight: "900", color: COLORS.ink, marginTop: 3 },
-  moneyHero: { position: "relative", borderRadius: 26, paddingHorizontal: 19, paddingVertical: 17, overflow: "hidden", shadowColor: "#5D49D6", shadowOpacity: .24, shadowRadius: 22, shadowOffset: { width: 0, height: 12 }, elevation: 10 },
+  moneyHero: { position: "relative", borderRadius: 22, borderWidth: 1, borderColor: "#2A3934", paddingHorizontal: 18, paddingVertical: 16, overflow: "hidden" },
+  homeTopShell: { position: "absolute", left: 18, right: 18, backgroundColor: "#090909", borderWidth: 1, borderColor: "#090909", padding: 18, overflow: "hidden", zIndex: 20, elevation: 16, shadowColor: "#000", shadowOpacity: .18, shadowRadius: 16, shadowOffset: { width: 0, height: 8 } },
+  homeHeader: { flexDirection: "row", alignItems: "center", justifyContent: "space-between", zIndex: 2 },
+  homeBrand: { flexDirection: "row", alignItems: "center", gap: 9 },
+  homeBrandMark: { width: 34, height: 34, borderRadius: 11, backgroundColor: "#BFE1DA", alignItems: "center", justifyContent: "center" },
+  homeLogo: { color: "#F8F7F3", fontSize: 19, fontWeight: "900", letterSpacing: -.7 },
+  homeHeaderActions: { flexDirection: "row", gap: 7 },
+  homeRoundButton: { width: 34, height: 34, borderRadius: 17, borderWidth: 1, borderColor: "#343434", backgroundColor: "#161616", alignItems: "center", justifyContent: "center" },
+  homeOrbitLarge: { position: "absolute", width: 150, height: 150, borderRadius: 75, borderWidth: 2, borderColor: "#FFFFFF14", right: -50, top: -41 },
+  homeOrbitSmall: { position: "absolute", width: 79, height: 79, borderRadius: 40, borderWidth: 2, borderColor: "#CFC4E52E", right: 35, top: 24 },
+  homeHeroSelector: { position: "absolute", left: 18, right: 18, top: 76, flexDirection: "row", justifyContent: "space-between", alignItems: "center" },
+  homeBalanceBlock: { position: "absolute", left: 18, right: 72 },
+  homeBalanceLabelStack: { height: 14, justifyContent: "center" },
+  homeExpandedBalanceLabel: { position: "absolute", marginTop: 0 },
+  compactBalanceLabel: { color: "#BFE1DA", fontSize: 7, fontWeight: "900", letterSpacing: .8 },
+  homeCollapsedBalanceLabel: { position: "absolute", textTransform: "uppercase" },
+  homeHeroStats: { position: "absolute", left: 18, right: 18, top: 224, marginTop: 0 },
+  compactBalanceMark: { position: "absolute", right: 16, top: 18, width: 38, height: 38, borderRadius: 12, backgroundColor: "#BFE1DA", alignItems: "center", justifyContent: "center" },
   heroOrbLarge: { position: "absolute", width: 190, height: 190, borderRadius: 95, backgroundColor: "#FFFFFF0A", right: -72, top: -78 },
   heroOrbSmall: { position: "absolute", width: 94, height: 94, borderRadius: 47, backgroundColor: "#A99CF812", right: 45, bottom: -55 },
   heroTop: { flexDirection: "row", justifyContent: "space-between", alignItems: "center" },
-  heroPill: { flexDirection: "row", alignItems: "center", gap: 6, borderRadius: 20, backgroundColor: "#FFFFFFEA", paddingHorizontal: 10, paddingVertical: 6 },
-  heroLiveDot: { width: 7, height: 7, borderRadius: 4, backgroundColor: COLORS.green },
-  heroPillText: { color: "#554D61", fontSize: 7.5, fontWeight: "900", letterSpacing: .7 },
-  heroMonth: { color: "#FFFFFFA8", fontSize: 8, fontWeight: "900", letterSpacing: .9 },
-  heroBalanceLabel: { color: "#D5CEF0", fontSize: 10.5, marginTop: 17 },
-  heroBalance: { color: "#FFF", fontSize: 34, fontWeight: "900", letterSpacing: -1.5, marginTop: 2 },
-  heroBalanceCaption: { color: "#FFFFFF8F", fontSize: 9, marginTop: 3 },
+  heroPill: { flexDirection: "row", alignItems: "center", gap: 6, borderRadius: 20, backgroundColor: "#1B1B1B", borderWidth: 1, borderColor: "#343434", paddingHorizontal: 10, paddingVertical: 6 },
+  heroLiveDot: { width: 6, height: 6, borderRadius: 3, backgroundColor: "#BFE1DA" },
+  heroPillText: { color: "#ECE9E2", fontSize: 8, fontWeight: "800", letterSpacing: .5, textTransform: "uppercase" },
+  heroMonth: { color: "#A7A39E", fontSize: 8, fontWeight: "800", letterSpacing: .7 },
+  heroBalanceLabel: { color: "#BFE1DA", fontSize: 10.5, fontWeight: "600", marginTop: 18 },
+  heroBalance: { color: "#FFF", fontSize: 36, fontWeight: "900", letterSpacing: -1.7, marginTop: 2 },
+  heroBalanceCaption: { color: "#8E8B87", fontSize: 9, marginTop: 3 },
   heroDivider: { height: 1, backgroundColor: "#FFFFFF1F", marginVertical: 15 },
-  heroStats: { flexDirection: "row", alignItems: "center" },
+  heroStats: { flexDirection: "row", alignItems: "center", backgroundColor: "#171717", borderRadius: 16, marginTop: 20, paddingHorizontal: 15, paddingVertical: 12 },
   heroStat: { flex: 1 },
-  heroStatLabel: { color: "#FFFFFF8F", fontSize: 7, fontWeight: "900", letterSpacing: .7, marginBottom: 4 },
-  heroStatValue: { color: "#FFF", fontSize: 12, fontWeight: "900" },
-  heroStatDivider: { width: 1, height: 27, backgroundColor: "#FFFFFF1F", marginHorizontal: 10 },
-  quickCard: { borderRadius: 22, borderWidth: 1, borderColor: "#393244", padding: 16, marginTop: 14, shadowColor: "#000", shadowOpacity: .3, shadowRadius: 20, shadowOffset: { width: 0, height: 10 }, elevation: 8 },
-  quickHeader: { flexDirection: "row", alignItems: "center", marginBottom: 15 },
-  bolt: { width: 42, height: 42, borderRadius: 14, alignItems: "center", justifyContent: "center", marginRight: 11 },
+  heroStatLabel: { color: "#8D8985", fontSize: 7, fontWeight: "900", letterSpacing: .7, marginBottom: 4 },
+  heroStatValue: { color: "#F7F5F0", fontSize: 12, fontWeight: "900" },
+  heroStatDivider: { width: 1, height: 27, backgroundColor: "#343434", marginHorizontal: 15 },
+  homeSheet: { backgroundColor: "#FCFBF8", borderTopLeftRadius: 28, borderTopRightRadius: 28, borderBottomLeftRadius: 22, borderBottomRightRadius: 22, padding: 18, marginTop: -12, zIndex: 3, shadowColor: "#181412", shadowOpacity: .08, shadowRadius: 18, shadowOffset: { width: 0, height: 8 }, elevation: 5 },
+  quickCard: { borderRadius: 20, borderWidth: 1, borderColor: "#E2DED8", padding: 15, marginTop: 12 },
+  quickHeader: { flexDirection: "row", alignItems: "center", marginBottom: 14 },
+  bolt: { width: 38, height: 38, borderRadius: 12, alignItems: "center", justifyContent: "center", marginRight: 10 },
   quickHeading: { flex: 1 },
   quickEyebrow: { color: "#938AA3", fontSize: 6.5, fontWeight: "900", letterSpacing: 1 },
-  quickTitle: { color: "#FFF", fontSize: 15, fontWeight: "900", letterSpacing: -.3, marginTop: 2 },
-  quickSubtitle: { color: "#918B99", fontSize: 8.5, marginTop: 2 },
+  quickTitle: { color: "#111111", fontSize: 18, fontWeight: "900", letterSpacing: -.5 },
+  quickSubtitle: { color: "#85807B", fontSize: 9, marginTop: 2 },
+  todayMiniBadge: { alignItems: "flex-end" },
+  todayMiniLabel: { color: "#9B9690", fontSize: 6.5, fontWeight: "900", letterSpacing: .8 },
+  todayMiniValue: { color: "#111111", fontSize: 12, fontWeight: "900", marginTop: 2 },
   quickReady: { flexDirection: "row", alignItems: "center", gap: 5, borderRadius: 14, backgroundColor: "#242B2A", paddingHorizontal: 8, paddingVertical: 6 },
   quickReadyDot: { width: 5, height: 5, borderRadius: 3, backgroundColor: COLORS.green },
   quickReadyText: { color: "#7BDDB5", fontSize: 6.5, fontWeight: "900", letterSpacing: .7 },
-  typeToggle: { flexDirection: "row", backgroundColor: "#201D27", padding: 4, borderRadius: 12, borderWidth: 1, borderColor: "#302A39", marginBottom: 14 },
+  typeToggle: { flexDirection: "row", backgroundColor: "#EFECE8", padding: 4, borderRadius: 12, marginBottom: 10 },
   typeButton: { flex: 1, height: 38, flexDirection: "row", gap: 6, alignItems: "center", justifyContent: "center", borderRadius: 9 },
-  typeButtonDebit: { backgroundColor: COLORS.coral },
-  typeButtonCredit: { backgroundColor: COLORS.green },
-  typeText: { color: "#8E8799", fontSize: 8, fontWeight: "900", letterSpacing: .25 },
+  typeButtonDebit: { backgroundColor: "#111111" },
+  typeButtonCredit: { backgroundColor: "#BFE1DA" },
+  typeText: { color: "#77736F", fontSize: 10, fontWeight: "800" },
   typeTextSelected: { color: "#FFF" },
-  quickFieldLabel: { color: "#797281", fontSize: 6.5, fontWeight: "900", letterSpacing: .9, marginLeft: 2, marginBottom: 6 },
-  descriptionWrap: { height: 49, flexDirection: "row", alignItems: "center", gap: 10, borderRadius: 12, borderWidth: 1, borderColor: "#3D3747", backgroundColor: "#292530", paddingHorizontal: 13, marginBottom: 12 },
-  descriptionInput: { flex: 1, height: "100%", color: "#FFF", paddingHorizontal: 0, fontSize: 13.5 },
+  typeTextCreditSelected: { color: "#111111" },
+  quickFieldLabel: { color: "#A4ADA9", fontSize: 9, fontWeight: "700", marginLeft: 2, marginBottom: 6 },
+  descriptionWrap: { height: 48, flexDirection: "row", alignItems: "center", gap: 10, borderRadius: 12, borderWidth: 1, borderColor: "#E2DED8", backgroundColor: "#F7F5F1", paddingHorizontal: 13, marginBottom: 9 },
+  descriptionInput: { flex: 1, height: "100%", color: "#111111", paddingHorizontal: 0, fontSize: 13.5 },
   amountRow: { flexDirection: "row", gap: 8 },
-  amountInputWrap: { flex: 1, height: 52, flexDirection: "row", alignItems: "center", borderRadius: 12, borderWidth: 1, borderColor: "#3D3747", backgroundColor: "#292530", paddingLeft: 8 },
-  currencyBadge: { height: 34, minWidth: 34, borderRadius: 9, backgroundColor: "#373140", alignItems: "center", justifyContent: "center", marginRight: 7 },
-  currency: { color: "#BDB5C9", fontSize: 10, fontWeight: "900" },
-  amountInput: { flex: 1, height: "100%", color: "#FFF", fontSize: 18, fontWeight: "900" },
-  addButton: { width: 122, borderRadius: 12, backgroundColor: COLORS.purple, alignItems: "center", justifyContent: "center", flexDirection: "row", gap: 7, shadowColor: COLORS.purple, shadowOpacity: .22, shadowRadius: 10, elevation: 4 },
-  addButtonText: { color: "#FFF", fontSize: 10, fontWeight: "900" },
+  amountInputWrap: { flex: 1, height: 50, flexDirection: "row", alignItems: "center", borderRadius: 12, borderWidth: 1, borderColor: "#E2DED8", backgroundColor: "#F7F5F1", paddingLeft: 8 },
+  currencyBadge: { height: 34, minWidth: 34, borderRadius: 9, backgroundColor: "#E8E2F2", alignItems: "center", justifyContent: "center", marginRight: 7 },
+  currency: { color: "#342F3A", fontSize: 10, fontWeight: "900" },
+  amountInput: { flex: 1, height: "100%", color: "#111111", fontSize: 18, fontWeight: "900" },
+  addButton: { width: 94, borderRadius: 12, backgroundColor: "#111111", alignItems: "center", justifyContent: "center", flexDirection: "row", gap: 6 },
+  addButtonText: { color: "#FFF", fontSize: 11, fontWeight: "900" },
   hintRow: { flexDirection: "row", alignItems: "center", gap: 5, marginTop: 10, marginLeft: 2 },
   hint: { color: "#8F8996", fontSize: 8.5 },
+  homeSectionTop: { flexDirection: "row", alignItems: "center", justifyContent: "space-between", marginTop: 23, marginBottom: 10 },
+  homeSectionTitle: { color: "#111111", fontSize: 15, fontWeight: "900", letterSpacing: -.35 },
+  homeSectionCaption: { color: "#918C87", fontSize: 8.5, marginTop: 2 },
+  homeSectionAction: { color: "#6C6560", fontSize: 8.5, fontWeight: "800" },
+  homeCategoryRow: { gap: 9, paddingRight: 3 },
+  homeCategoryCard: { width: 108, minHeight: 108, borderRadius: 18, backgroundColor: "#EEEAE5", padding: 12 },
+  homeCategoryCardLilac: { backgroundColor: "#E7E0F1" },
+  homeCategoryCardMint: { backgroundColor: "#CDE7E1" },
+  homeCategoryIcon: { width: 30, height: 30, borderRadius: 10, backgroundColor: "#FFFFFFAA", alignItems: "center", justifyContent: "center", marginBottom: 12 },
+  homeCategoryName: { color: "#504B47", fontSize: 9, fontWeight: "700" },
+  homeCategoryValue: { color: "#111111", fontSize: 13, fontWeight: "900", marginTop: 4 },
+  homeList: { borderTopWidth: 1, borderTopColor: "#EAE6E0" },
+  homeTransaction: { minHeight: 62, flexDirection: "row", alignItems: "center", borderBottomWidth: StyleSheet.hairlineWidth, borderBottomColor: "#E4E0DA" },
+  homeTransactionIcon: { width: 36, height: 36, borderRadius: 11, alignItems: "center", justifyContent: "center", marginRight: 10 },
+  homeTransactionTitle: { color: "#111111", fontSize: 11.5, fontWeight: "800" },
+  homeTransactionMeta: { color: "#918C87", fontSize: 8.5, marginTop: 3 },
+  homeTransactionAmount: { color: "#111111", fontSize: 10.5, fontWeight: "900" },
+  homeCreditAmount: { color: "#2B856B" },
+  homeEmpty: { color: "#8E8984", fontSize: 10, textAlign: "center", paddingVertical: 25 },
   statsRow: { display: "none" },
   statCard: { flex: 1, backgroundColor: COLORS.paper, borderWidth: 1, borderColor: COLORS.line, borderRadius: 16, padding: 14 },
   statIcon: { width: 32, height: 32, borderRadius: 10, alignItems: "center", justifyContent: "center", marginBottom: 12 },
@@ -1552,12 +1805,12 @@ const styles = StyleSheet.create({
   recapInsight: { flexDirection: "row", alignItems: "flex-start", gap: 8, backgroundColor: "#FFFFFF14", borderRadius: 11, padding: 11 },
   recapInsightText: { flex: 1, color: "#DDD7F4", fontSize: 9.5, lineHeight: 14 },
   recapStrong: { color: "#FFF", fontWeight: "800" },
-  smartInsight: { flexDirection: "row", alignItems: "center", gap: 11, backgroundColor: COLORS.paper, borderRadius: 18, borderWidth: 1, borderColor: COLORS.line, padding: 13, marginTop: 14 },
+  smartInsight: { flexDirection: "row", alignItems: "center", gap: 11, backgroundColor: COLORS.paper, borderRadius: 16, borderWidth: 1, borderColor: COLORS.line, padding: 13, marginTop: 12 },
   smartInsightIcon: { width: 43, height: 43, borderRadius: 14, alignItems: "center", justifyContent: "center" },
   smartInsightLabel: { color: "#91899C", fontSize: 7, fontWeight: "900", letterSpacing: .8 },
   smartInsightTitle: { color: COLORS.ink, fontSize: 11.5, fontWeight: "900", marginTop: 3 },
   smartInsightCopy: { color: COLORS.muted, fontSize: 8.5, lineHeight: 12.5, marginTop: 2 },
-  smartInsightArrow: { width: 34, height: 34, borderRadius: 11, backgroundColor: "#29233A", alignItems: "center", justifyContent: "center" },
+  smartInsightArrow: { width: 34, height: 34, borderRadius: 11, backgroundColor: "#20342D", alignItems: "center", justifyContent: "center" },
   sectionHeader: { flexDirection: "row", alignItems: "flex-end", justifyContent: "space-between", marginTop: 25, marginBottom: 10 },
   sectionTitle: { color: COLORS.ink, fontSize: 17, fontWeight: "900", letterSpacing: -.5 },
   sectionAction: { color: COLORS.purple, fontSize: 11, fontWeight: "800" },
@@ -1572,10 +1825,10 @@ const styles = StyleSheet.create({
   pageIntro: { marginBottom: 20 },
   insightPageIntro: { flexDirection: "row", alignItems: "center", justifyContent: "space-between", marginBottom: 14 },
   pageTitle: { color: COLORS.ink, fontSize: 30, fontWeight: "900", letterSpacing: -1.2 },
-  insightLivePill: { flexDirection: "row", alignItems: "center", gap: 6, backgroundColor: "#172A23", borderWidth: 1, borderColor: "#244638", borderRadius: 20, paddingHorizontal: 10, paddingVertical: 7 },
+  insightLivePill: { flexDirection: "row", alignItems: "center", gap: 6, backgroundColor: "#DCEDE7", borderWidth: 1, borderColor: "#C5DED5", borderRadius: 20, paddingHorizontal: 10, paddingVertical: 7 },
   insightLiveDot: { width: 6, height: 6, borderRadius: 3, backgroundColor: COLORS.green },
-  insightLiveText: { color: "#74DCAF", fontSize: 7, fontWeight: "900", letterSpacing: .8 },
-  insightHero: { position: "relative", borderRadius: 25, padding: 18, overflow: "hidden", marginBottom: 14, shadowColor: "#5D49D6", shadowOpacity: .26, shadowRadius: 22, shadowOffset: { width: 0, height: 12 }, elevation: 10 },
+  insightLiveText: { color: "#347B64", fontSize: 7, fontWeight: "900", letterSpacing: .8 },
+  insightHero: { position: "relative", borderRadius: 25, padding: 18, overflow: "hidden", marginBottom: 14, shadowColor: "#151210", shadowOpacity: .16, shadowRadius: 18, shadowOffset: { width: 0, height: 10 }, elevation: 7 },
   insightOrbLarge: { position: "absolute", width: 190, height: 190, borderRadius: 95, backgroundColor: "#FFFFFF0A", right: -68, top: -92 },
   insightOrbSmall: { position: "absolute", width: 92, height: 92, borderRadius: 46, backgroundColor: "#B5A9FF0D", left: -34, bottom: -44 },
   insightHeroTop: { flexDirection: "row", alignItems: "center", justifyContent: "space-between" },
@@ -1590,15 +1843,15 @@ const styles = StyleSheet.create({
   insightHeroMetricLabel: { color: "#FFFFFF78", fontSize: 6.5, fontWeight: "900", letterSpacing: .65, marginBottom: 4 },
   insightHeroMetricValue: { color: "#FFF", fontSize: 11.5, fontWeight: "900" },
   insightHeroMetricDivider: { width: 1, height: 27, backgroundColor: "#FFFFFF1C", marginHorizontal: 9 },
-  dateFilterCard: { backgroundColor: "#17151E", borderWidth: 1, borderColor: "#332E3D", borderRadius: 20, padding: 14, marginBottom: 12 },
+  dateFilterCard: { backgroundColor: COLORS.paper, borderWidth: 1, borderColor: COLORS.line, borderRadius: 20, padding: 14, marginBottom: 12 },
   dateFilterTop: { flexDirection: "row", alignItems: "center", justifyContent: "space-between", marginBottom: 13 },
   dateFilterEyebrow: { color: "#81798B", fontSize: 7, fontWeight: "900", letterSpacing: .9 },
   dateFilterTitle: { color: COLORS.ink, fontSize: 14, fontWeight: "900", letterSpacing: -.25, marginTop: 3 },
-  dateFilterIcon: { width: 38, height: 38, borderRadius: 12, backgroundColor: "#29233E", alignItems: "center", justifyContent: "center" },
+  dateFilterIcon: { width: 38, height: 38, borderRadius: 12, backgroundColor: "#E8E2F2", alignItems: "center", justifyContent: "center" },
   dateChips: { flexDirection: "row", gap: 5 },
-  dateChip: { flex: 1, height: 36, borderRadius: 10, backgroundColor: "#24212B", borderWidth: 1, borderColor: "#312B39", alignItems: "center", justifyContent: "center" },
+  dateChip: { flex: 1, height: 36, borderRadius: 10, backgroundColor: "#F0ECE7", borderWidth: 1, borderColor: "#E2DED8", alignItems: "center", justifyContent: "center" },
   customDateChip: { flexDirection: "row", gap: 4, flex: 1.25 },
-  dateChipActive: { backgroundColor: COLORS.purple, borderColor: "#8E7BF5" },
+  dateChipActive: { backgroundColor: "#111111", borderColor: "#111111" },
   dateChipText: { color: "#9992A1", fontSize: 8.5, fontWeight: "900" },
   dateChipTextActive: { color: "#FFF" },
   summaryStrip: { flexDirection: "row", alignItems: "center", justifyContent: "space-between", backgroundColor: COLORS.paper, borderWidth: 1, borderColor: COLORS.line, borderRadius: 16, padding: 15, marginBottom: 14 },
@@ -1607,51 +1860,51 @@ const styles = StyleSheet.create({
   summaryDivider: { width: 1, height: 28, backgroundColor: COLORS.line },
   outlineButton: { height: 44, borderWidth: 1, borderColor: COLORS.line, borderRadius: 13, alignItems: "center", justifyContent: "center", marginTop: 12, backgroundColor: COLORS.paper },
   outlineButtonText: { color: COLORS.purple, fontSize: 11, fontWeight: "800" },
-  emptyDateCard: { minHeight: 180, backgroundColor: "#17151E", borderWidth: 1, borderColor: "#302B38", borderRadius: 18, alignItems: "center", justifyContent: "center", padding: 22 },
-  emptyDateIcon: { width: 52, height: 52, borderRadius: 17, backgroundColor: "#28223D", alignItems: "center", justifyContent: "center", marginBottom: 12 },
+  emptyDateCard: { minHeight: 180, backgroundColor: COLORS.paper, borderWidth: 1, borderColor: COLORS.line, borderRadius: 18, alignItems: "center", justifyContent: "center", padding: 22 },
+  emptyDateIcon: { width: 52, height: 52, borderRadius: 17, backgroundColor: "#E8E2F2", alignItems: "center", justifyContent: "center", marginBottom: 12 },
   emptyDateTitle: { color: COLORS.ink, fontSize: 14, fontWeight: "900" },
   emptyDateCopy: { color: COLORS.muted, fontSize: 9.5, textAlign: "center", lineHeight: 14, marginTop: 5, maxWidth: 220 },
-  analysisCard: { backgroundColor: "#17151E", borderRadius: 22, borderWidth: 1, borderColor: "#332E3D", padding: 16, overflow: "hidden" },
+  analysisCard: { backgroundColor: COLORS.paper, borderRadius: 22, borderWidth: 1, borderColor: COLORS.line, padding: 16, overflow: "hidden" },
   insightSectionTop: { flexDirection: "row", alignItems: "center", justifyContent: "space-between", marginBottom: 8 },
-  insightSectionIcon: { width: 38, height: 38, borderRadius: 13, backgroundColor: "#29233E", alignItems: "center", justifyContent: "center" },
-  trendCard: { backgroundColor: "#17151E", borderRadius: 22, borderWidth: 1, borderColor: "#302B38", padding: 16, marginTop: 14, overflow: "hidden" },
-  cashflowCard: { backgroundColor: "#17151E", borderRadius: 22, borderWidth: 1, borderColor: "#302B38", padding: 16, marginTop: 14 },
+  insightSectionIcon: { width: 38, height: 38, borderRadius: 13, backgroundColor: "#E8E2F2", alignItems: "center", justifyContent: "center" },
+  trendCard: { backgroundColor: COLORS.paper, borderRadius: 22, borderWidth: 1, borderColor: COLORS.line, padding: 16, marginTop: 14, overflow: "hidden" },
+  cashflowCard: { backgroundColor: COLORS.paper, borderRadius: 22, borderWidth: 1, borderColor: COLORS.line, padding: 16, marginTop: 14 },
   chartHeader: { flexDirection: "row", alignItems: "center", justifyContent: "space-between", marginBottom: 15 },
   chartTitle: { color: COLORS.ink, fontSize: 16, fontWeight: "900", letterSpacing: -.4 },
-  chartTotalPill: { backgroundColor: "#28223E", borderRadius: 20, paddingHorizontal: 10, paddingVertical: 7 },
-  chartTotalText: { color: "#A997FF", fontSize: 9, fontWeight: "900" },
+  chartTotalPill: { backgroundColor: "#E8E2F2", borderRadius: 20, paddingHorizontal: 10, paddingVertical: 7 },
+  chartTotalText: { color: "#705A99", fontSize: 9, fontWeight: "900" },
   weekChart: { height: 145, flexDirection: "row", alignItems: "flex-end", gap: 6, paddingTop: 4 },
   weekColumn: { flex: 1, height: "100%", alignItems: "center", justifyContent: "flex-end" },
   weekValue: { color: COLORS.muted, fontSize: 7, fontWeight: "800", width: "100%", textAlign: "center", marginBottom: 5 },
-  weekBarSlot: { height: 92, width: "64%", justifyContent: "flex-end", borderRadius: 7, backgroundColor: "#24212B", overflow: "hidden" },
+  weekBarSlot: { height: 92, width: "64%", justifyContent: "flex-end", borderRadius: 7, backgroundColor: "#ECE8E3", overflow: "hidden" },
   weekBar: { width: "100%", borderRadius: 7 },
   weekLabel: { color: "#8F8998", fontSize: 8, fontWeight: "800", marginTop: 7 },
   flowRow: { marginTop: 12 },
   flowTop: { flexDirection: "row", justifyContent: "space-between", alignItems: "center", marginBottom: 7 },
   flowLabel: { color: COLORS.muted, fontSize: 8, fontWeight: "900", letterSpacing: .8 },
   flowValue: { color: COLORS.ink, fontSize: 10.5, fontWeight: "900" },
-  flowTrack: { height: 10, borderRadius: 8, backgroundColor: "#24212B", overflow: "hidden" },
+  flowTrack: { height: 10, borderRadius: 8, backgroundColor: "#ECE8E3", overflow: "hidden" },
   flowFill: { height: "100%", borderRadius: 8 },
   netFlow: { flexDirection: "row", justifyContent: "space-between", alignItems: "center", borderTopWidth: 1, borderTopColor: COLORS.line, marginTop: 17, paddingTop: 13 },
   netFlowLabel: { color: COLORS.muted, fontSize: 8, fontWeight: "900", letterSpacing: .8 },
   netFlowValue: { fontSize: 14, fontWeight: "900" },
-  trendDirection: { color: COLORS.green, fontSize: 8, fontWeight: "900", backgroundColor: "#1A2B25", borderRadius: 15, paddingHorizontal: 9, paddingVertical: 6 },
+  trendDirection: { color: "#347B64", fontSize: 8, fontWeight: "900", backgroundColor: "#DCEDE7", borderRadius: 15, paddingHorizontal: 9, paddingVertical: 6 },
   monthWeekChart: { height: 124, flexDirection: "row", alignItems: "flex-end", gap: 10 },
   monthWeekColumn: { flex: 1, height: "100%", alignItems: "center", justifyContent: "flex-end" },
-  monthWeekSlot: { height: 78, width: "72%", justifyContent: "flex-end", backgroundColor: "#24212B", borderRadius: 8, overflow: "hidden" },
+  monthWeekSlot: { height: 78, width: "72%", justifyContent: "flex-end", backgroundColor: "#ECE8E3", borderRadius: 8, overflow: "hidden" },
   monthWeekBar: { width: "100%", borderRadius: 8, backgroundColor: COLORS.purple },
   monthWeekValue: { color: COLORS.ink, fontSize: 7, fontWeight: "800", marginTop: 3, maxWidth: 58 },
   metricGrid: { flexDirection: "row", flexWrap: "wrap", gap: 10, marginTop: 14 },
-  metricCard: { width: "48.4%", backgroundColor: "#17151E", borderRadius: 18, borderWidth: 1, borderColor: "#302B38", padding: 14 },
+  metricCard: { width: "48.4%", backgroundColor: COLORS.paper, borderRadius: 18, borderWidth: 1, borderColor: COLORS.line, padding: 14 },
   metricIcon: { width: 33, height: 33, borderRadius: 10, alignItems: "center", justifyContent: "center", marginBottom: 11 },
   metricLabel: { color: COLORS.muted, fontSize: 7.5, fontWeight: "900", letterSpacing: .65 },
   metricValue: { color: COLORS.ink, fontSize: 16, fontWeight: "900", marginTop: 5 },
   chartRow: { flexDirection: "row", alignItems: "center", marginVertical: 8 },
   donutWrap: { width: 145, height: 145, alignItems: "center", justifyContent: "center" },
   donutGlow: { position: "absolute", width: 144, height: 144, borderRadius: 72 },
-  donutRing: { width: 126, height: 126, borderRadius: 63, borderWidth: 12, alignItems: "center", justifyContent: "center", backgroundColor: "#24212B" },
+  donutRing: { width: 126, height: 126, borderRadius: 63, borderWidth: 12, alignItems: "center", justifyContent: "center", backgroundColor: "#ECE8E3" },
   donutArcAccent: { position: "absolute", width: 126, height: 126, borderRadius: 63, borderWidth: 12, borderLeftColor: "transparent", borderBottomColor: "transparent", transform: [{ rotate: "18deg" }] },
-  donutInner: { width: 96, height: 96, borderRadius: 48, backgroundColor: "#17151E", alignItems: "center" },
+  donutInner: { width: 96, height: 96, borderRadius: 48, backgroundColor: COLORS.paper, alignItems: "center" },
   donutIcon: { position: "absolute", top: 8, width: 27, height: 27, borderRadius: 9, alignItems: "center", justifyContent: "center" },
   donutText: { position: "absolute", alignItems: "center", marginTop: 25 },
   donutLabel: { color: "#817A89", fontSize: 6.5, fontWeight: "900", letterSpacing: .65, marginTop: 1 },
@@ -1671,7 +1924,7 @@ const styles = StyleSheet.create({
   categoryBarNumbers: { flexDirection: "row", alignItems: "center", gap: 9 },
   categoryBarPercent: { color: "#847D8E", fontSize: 8, fontWeight: "900" },
   categoryBarValue: { color: COLORS.ink, fontSize: 9.5, fontWeight: "900" },
-  barTrack: { height: 6, borderRadius: 5, backgroundColor: "#24212B", overflow: "hidden" },
+  barTrack: { height: 6, borderRadius: 5, backgroundColor: "#ECE8E3", overflow: "hidden" },
   barFill: { height: "100%", borderRadius: 5 },
   monthCards: { flexDirection: "row", gap: 12, marginTop: 14 },
   monthCard: { flex: 1, borderRadius: 16, padding: 15 },
@@ -1681,62 +1934,228 @@ const styles = StyleSheet.create({
   notificationIcon: { width: 40, height: 40, borderRadius: 12, backgroundColor: "#292341", alignItems: "center", justifyContent: "center" },
   notificationTitle: { color: COLORS.ink, fontSize: 11.5, fontWeight: "800" },
   notificationCopy: { color: COLORS.muted, fontSize: 9.5, marginTop: 3 },
+  appDialogBackdrop: { flex: 1, alignItems: "center", justifyContent: "center", paddingHorizontal: 24, backgroundColor: "#171411A8" },
+  appDialogCard: { width: "100%", maxWidth: 390, borderRadius: 28, backgroundColor: "#FCFBF8", borderWidth: 1, borderColor: "#E2DED8", padding: 22, alignItems: "center", shadowColor: "#000", shadowOpacity: .24, shadowRadius: 28, shadowOffset: { width: 0, height: 14 }, elevation: 22 },
+  appDialogIcon: { width: 52, height: 52, borderRadius: 17, alignItems: "center", justifyContent: "center", marginBottom: 16 },
+  appDialogTitle: { color: "#111111", fontSize: 21, fontWeight: "900", letterSpacing: -.6, textAlign: "center" },
+  appDialogMessage: { color: "#77716C", fontSize: 11.5, lineHeight: 17, textAlign: "center", marginTop: 8, maxWidth: 300 },
+  appDialogActions: { width: "100%", flexDirection: "row", gap: 9, marginTop: 22 },
+  appDialogButton: { flex: 1, minHeight: 48, borderRadius: 14, backgroundColor: "#111111", alignItems: "center", justifyContent: "center", paddingHorizontal: 12 },
+  appDialogButtonCancel: { backgroundColor: "#EFECE8", borderWidth: 1, borderColor: "#E2DED8" },
+  appDialogButtonDanger: { backgroundColor: "#D96F61" },
+  appDialogButtonText: { color: "#FFFFFF", fontSize: 11, fontWeight: "900" },
+  appDialogButtonTextCancel: { color: "#5F5954" },
   overviewPickerBackdrop: { flex: 1, justifyContent: "flex-end", paddingHorizontal: 12, paddingBottom: 12, backgroundColor: "#000000C2" },
-  overviewPickerCard: { backgroundColor: "#19161F", borderRadius: 25, borderWidth: 1, borderColor: "#403748", padding: 18, shadowColor: "#000", shadowOpacity: .55, shadowRadius: 25, elevation: 20 },
+  overviewPickerCard: { backgroundColor: "#FCFBF8", borderRadius: 25, borderWidth: 1, borderColor: "#E2DED8", padding: 18, shadowColor: "#000", shadowOpacity: .22, shadowRadius: 25, elevation: 20 },
   overviewPickerHeader: { flexDirection: "row", alignItems: "flex-start", justifyContent: "space-between" },
   overviewPickerCopy: { color: COLORS.muted, fontSize: 9.5, marginTop: 5 },
   overviewPickerGrid: { gap: 8, marginTop: 18 },
-  overviewPickerOption: { height: 62, borderRadius: 16, borderWidth: 1, borderColor: "#332D3B", backgroundColor: "#221F29", flexDirection: "row", alignItems: "center", gap: 11, paddingHorizontal: 12 },
-  overviewPickerOptionActive: { borderColor: "#6757C9", backgroundColor: "#29233C" },
+  overviewPickerOption: { height: 62, borderRadius: 16, borderWidth: 1, borderColor: "#E2DED8", backgroundColor: "#F4F1EE", flexDirection: "row", alignItems: "center", gap: 11, paddingHorizontal: 12 },
+  overviewPickerOptionActive: { borderColor: "#111111", backgroundColor: "#E8E2F2" },
   overviewPickerIcon: { width: 39, height: 39, borderRadius: 12, alignItems: "center", justifyContent: "center" },
   overviewPickerLabel: { color: COLORS.ink, fontSize: 11.5, fontWeight: "900" },
   overviewPickerOptionCopy: { color: "#8D8695", fontSize: 8.5, marginTop: 3 },
   calendarBackdrop: { flex: 1, justifyContent: "center", paddingHorizontal: 18, backgroundColor: "#000000C2" },
-  calendarCard: { backgroundColor: "#19161F", borderRadius: 24, borderWidth: 1, borderColor: "#403748", padding: 18, shadowColor: "#000", shadowOpacity: .55, shadowRadius: 25, elevation: 20 },
+  calendarCard: { backgroundColor: "#FCFBF8", borderRadius: 24, borderWidth: 1, borderColor: "#E2DED8", padding: 18, shadowColor: "#000", shadowOpacity: .22, shadowRadius: 25, elevation: 20 },
   calendarHeader: { flexDirection: "row", alignItems: "center", justifyContent: "space-between" },
   calendarEyebrow: { color: "#938A9D", fontSize: 7.5, fontWeight: "900", letterSpacing: 1.1 },
   calendarTitle: { color: COLORS.ink, fontSize: 21, fontWeight: "900", letterSpacing: -.6, marginTop: 3 },
-  calendarClose: { width: 37, height: 37, borderRadius: 12, backgroundColor: "#27232E", alignItems: "center", justifyContent: "center" },
+  calendarClose: { width: 37, height: 37, borderRadius: 12, backgroundColor: "#F0ECE7", alignItems: "center", justifyContent: "center" },
   calendarMonthRow: { flexDirection: "row", alignItems: "center", justifyContent: "space-between", marginTop: 20, marginBottom: 13 },
-  calendarArrow: { width: 38, height: 38, borderRadius: 12, backgroundColor: "#28233A", alignItems: "center", justifyContent: "center" },
+  calendarArrow: { width: 38, height: 38, borderRadius: 12, backgroundColor: "#E8E2F2", alignItems: "center", justifyContent: "center" },
   calendarMonthText: { color: COLORS.ink, fontSize: 14, fontWeight: "900" },
-  calendarWeekRow: { flexDirection: "row", borderBottomWidth: 1, borderBottomColor: "#302A38", paddingBottom: 9, marginBottom: 5 },
+  calendarWeekRow: { flexDirection: "row", borderBottomWidth: 1, borderBottomColor: "#E2DED8", paddingBottom: 9, marginBottom: 5 },
   calendarWeekday: { width: "14.285%", color: "#7F7788", fontSize: 8, fontWeight: "900", textAlign: "center" },
   calendarGrid: { flexDirection: "row", flexWrap: "wrap" },
   calendarDay: { width: "14.285%", height: 39, borderRadius: 11, alignItems: "center", justifyContent: "center" },
   calendarDaySelected: { backgroundColor: COLORS.purple },
   calendarDayToday: { borderWidth: 1, borderColor: "#6D5BD1" },
-  calendarDayText: { color: "#C2BCC8", fontSize: 11, fontWeight: "700" },
+  calendarDayText: { color: "#514C48", fontSize: 11, fontWeight: "700" },
   calendarDayTextSelected: { color: "#FFF", fontWeight: "900" },
-  calendarTodayButton: { height: 44, borderRadius: 13, backgroundColor: "#28233A", flexDirection: "row", alignItems: "center", justifyContent: "center", gap: 7, marginTop: 12 },
-  calendarTodayText: { color: "#B9AEFF", fontSize: 10, fontWeight: "900" },
+  calendarTodayButton: { height: 44, borderRadius: 13, backgroundColor: "#E8E2F2", flexDirection: "row", alignItems: "center", justifyContent: "center", gap: 7, marginTop: 12 },
+  calendarTodayText: { color: "#67518F", fontSize: 10, fontWeight: "900" },
   editorBackdrop: { flex: 1, justifyContent: "center", paddingHorizontal: 20, backgroundColor: "#000000B8" },
-  editorCard: { backgroundColor: "#1A171F", borderRadius: 24, borderWidth: 1, borderColor: "#3A3342", padding: 20, shadowColor: "#000", shadowOpacity: .5, shadowRadius: 24, elevation: 18 },
+  editorCard: { backgroundColor: "#FCFBF8", borderRadius: 24, borderWidth: 1, borderColor: "#E2DED8", padding: 20, shadowColor: "#000", shadowOpacity: .22, shadowRadius: 24, elevation: 18 },
   editorHeader: { flexDirection: "row", alignItems: "center", justifyContent: "space-between", marginBottom: 17 },
   editorEyebrow: { color: "#938B9E", fontSize: 8, fontWeight: "900", letterSpacing: 1.2 },
   editorTitle: { color: COLORS.ink, fontSize: 22, fontWeight: "900", letterSpacing: -.7, marginTop: 4 },
-  editorClose: { width: 36, height: 36, borderRadius: 12, backgroundColor: "#25212B", alignItems: "center", justifyContent: "center" },
-  editorToggle: { flexDirection: "row", backgroundColor: "#25212B", borderRadius: 12, padding: 4, marginBottom: 17 },
+  editorClose: { width: 36, height: 36, borderRadius: 12, backgroundColor: "#F0ECE7", alignItems: "center", justifyContent: "center" },
+  editorToggle: { flexDirection: "row", backgroundColor: "#F0ECE7", borderRadius: 12, padding: 4, marginBottom: 17 },
   editorTypeButton: { flex: 1, height: 40, borderRadius: 9, alignItems: "center", justifyContent: "center" },
   editorDebit: { backgroundColor: COLORS.coral },
-  editorCredit: { backgroundColor: COLORS.green },
+  editorCredit: { backgroundColor: "#BFE1DA" },
   editorTypeText: { color: "#938D9B", fontSize: 9, fontWeight: "900", letterSpacing: .5 },
   editorTypeTextActive: { color: "#FFF" },
+  editorTypeTextCreditActive: { color: "#111111" },
   editorLabel: { color: "#8F8898", fontSize: 8, fontWeight: "900", letterSpacing: 1, marginBottom: 7, marginTop: 2 },
-  editorInput: { height: 52, borderRadius: 13, borderWidth: 1, borderColor: "#3D3645", backgroundColor: "#25212B", color: COLORS.ink, paddingHorizontal: 14, fontSize: 14, marginBottom: 14 },
-  editorAmountWrap: { height: 52, borderRadius: 13, borderWidth: 1, borderColor: "#3D3645", backgroundColor: "#25212B", flexDirection: "row", alignItems: "center", paddingHorizontal: 14 },
+  editorInput: { height: 52, borderRadius: 13, borderWidth: 1, borderColor: "#E2DED8", backgroundColor: "#F7F5F1", color: COLORS.ink, paddingHorizontal: 14, fontSize: 14, marginBottom: 14 },
+  editorAmountWrap: { height: 52, borderRadius: 13, borderWidth: 1, borderColor: "#E2DED8", backgroundColor: "#F7F5F1", flexDirection: "row", alignItems: "center", paddingHorizontal: 14 },
   editorCurrency: { color: COLORS.muted, fontSize: 13, fontWeight: "800", marginRight: 8 },
   editorAmountInput: { flex: 1, height: "100%", color: COLORS.ink, fontSize: 17, fontWeight: "900" },
   categoryPicker: { gap: 7, paddingRight: 8 },
-  categoryChip: { height: 36, borderRadius: 11, borderWidth: 1, borderColor: "#3D3645", backgroundColor: "#25212B", flexDirection: "row", alignItems: "center", gap: 5, paddingHorizontal: 10 },
+  categoryChip: { height: 36, borderRadius: 11, borderWidth: 1, borderColor: "#E2DED8", backgroundColor: "#F4F1EE", flexDirection: "row", alignItems: "center", gap: 5, paddingHorizontal: 10 },
   categoryChipText: { color: COLORS.muted, fontSize: 9, fontWeight: "800" },
   editorSave: { height: 52, borderRadius: 14, backgroundColor: COLORS.purple, flexDirection: "row", alignItems: "center", justifyContent: "center", gap: 7, marginTop: 18 },
   editorSaveText: { color: "#FFF", fontSize: 12, fontWeight: "900" },
   editorDelete: { height: 44, flexDirection: "row", alignItems: "center", justifyContent: "center", gap: 6, marginTop: 5 },
   editorDeleteText: { color: COLORS.coral, fontSize: 10.5, fontWeight: "800" },
-  tabBar: { position: "absolute", left: 16, right: 16, bottom: 14, height: 66, borderRadius: 20, backgroundColor: "#292731", flexDirection: "row", paddingHorizontal: 14, shadowColor: "#1F1C25", shadowOpacity: .25, shadowRadius: 15, shadowOffset: { width: 0, height: 7 }, elevation: 12 },
+  tabBar: { position: "absolute", left: 16, right: 16, bottom: 14, height: 62, borderRadius: 18, borderWidth: 1, borderColor: COLORS.line, backgroundColor: "#FCFBF8", flexDirection: "row", paddingHorizontal: 14, elevation: 10 },
+  homeTabBar: { backgroundColor: "#FCFBF8", borderColor: "#E2DED8", shadowColor: "#14110F", shadowOpacity: .12, shadowRadius: 12, shadowOffset: { width: 0, height: 7 } },
   tabButton: { flex: 1, alignItems: "center", justifyContent: "center", gap: 3 },
   tabText: { color: "#97939C", fontSize: 8.5, fontWeight: "700" },
   tabTextActive: { color: "#FFF" },
+  homeTabTextActive: { color: "#111111" },
   tabDot: { position: "absolute", bottom: 5, width: 4, height: 4, borderRadius: 2, backgroundColor: COLORS.coral },
 });
+
+const darkStyles = StyleSheet.create({
+  safe: { backgroundColor: "#0C0E0D" },
+  homeSafe: { backgroundColor: "#0C0E0D" },
+  headerButton: { backgroundColor: "#191C1A", borderColor: "#303531" },
+  logo: { color: "#F4F5F2" },
+  tagline: { color: "#959C97" },
+  eyebrow: { color: "#9DA29E" },
+  subtitle: { color: "#9DA29E" },
+  pageTitle: { color: "#F4F5F2" },
+  sectionTitle: { color: "#F4F5F2" },
+  sectionAction: { color: "#B9A8D3" },
+
+  homeSheet: { backgroundColor: "#151816", borderColor: "#2B302C", shadowOpacity: .32 },
+  quickTitle: { color: "#F4F5F2" },
+  quickSubtitle: { color: "#969C98" },
+  todayMiniLabel: { color: "#8F9691" },
+  todayMiniValue: { color: "#F4F5F2" },
+  typeToggle: { backgroundColor: "#242825" },
+  typeButtonDebit: { backgroundColor: "#F4F5F2" },
+  typeButtonCredit: { backgroundColor: "#8FC8B6" },
+  typeText: { color: "#9AA09C" },
+  typeTextSelected: { color: "#111311" },
+  descriptionWrap: { backgroundColor: "#1E221F", borderColor: "#343A35" },
+  descriptionInput: { color: "#F4F5F2" },
+  amountInputWrap: { backgroundColor: "#1E221F", borderColor: "#343A35" },
+  currencyBadge: { backgroundColor: "#3A3345" },
+  currency: { color: "#DED4EB" },
+  amountInput: { color: "#F4F5F2" },
+  addButton: { backgroundColor: "#080A09", borderWidth: 1, borderColor: "#363B37" },
+  homeSectionTitle: { color: "#F4F5F2" },
+  homeSectionCaption: { color: "#929994" },
+  homeSectionAction: { color: "#B8AEA7" },
+  homeCategoryCard: { backgroundColor: "#282A28" },
+  homeCategoryCardLilac: { backgroundColor: "#322D3B" },
+  homeCategoryCardMint: { backgroundColor: "#233832" },
+  homeCategoryIcon: { backgroundColor: "#FFFFFF12" },
+  homeCategoryName: { color: "#B6BBB7" },
+  homeCategoryValue: { color: "#F4F5F2" },
+  homeList: { borderTopColor: "#2E332F" },
+  homeTransaction: { borderBottomColor: "#2E332F" },
+  homeTransactionTitle: { color: "#F4F5F2" },
+  homeTransactionMeta: { color: "#929994" },
+  homeTransactionAmount: { color: "#F4F5F2" },
+  homeEmpty: { color: "#929994" },
+
+  dateFilterCard: { backgroundColor: "#171A18", borderColor: "#303531" },
+  dateFilterEyebrow: { color: "#969C98" },
+  dateFilterTitle: { color: "#F4F5F2" },
+  dateFilterIcon: { backgroundColor: "#352F40" },
+  dateChip: { backgroundColor: "#242825", borderColor: "#343A35" },
+  dateChipText: { color: "#A1A6A2" },
+  summaryStrip: { backgroundColor: "#171A18", borderColor: "#303531" },
+  summaryLabel: { color: "#929994" },
+  summaryValue: { color: "#F4F5F2" },
+  summaryDivider: { backgroundColor: "#303531" },
+  listCard: { backgroundColor: "#171A18", borderColor: "#303531" },
+  transaction: { borderBottomColor: "#303531" },
+  transactionTitle: { color: "#F4F5F2" },
+  transactionMeta: { color: "#929994" },
+  transactionAmount: { color: "#F4F5F2" },
+  outlineButton: { backgroundColor: "#171A18", borderColor: "#303531" },
+  outlineButtonText: { color: "#B9A8D3" },
+  emptyDateCard: { backgroundColor: "#171A18", borderColor: "#303531" },
+  emptyDateIcon: { backgroundColor: "#352F40" },
+  emptyDateTitle: { color: "#F4F5F2" },
+  emptyDateCopy: { color: "#929994" },
+
+  insightLivePill: { backgroundColor: "#20352E", borderColor: "#2C4A40" },
+  insightLiveText: { color: "#82C9B1" },
+  analysisCard: { backgroundColor: "#171A18", borderColor: "#303531" },
+  insightSectionIcon: { backgroundColor: "#352F40" },
+  trendCard: { backgroundColor: "#171A18", borderColor: "#303531" },
+  cashflowCard: { backgroundColor: "#171A18", borderColor: "#303531" },
+  chartTitle: { color: "#F4F5F2" },
+  chartTotalPill: { backgroundColor: "#352F40" },
+  chartTotalText: { color: "#C1AFDC" },
+  weekValue: { color: "#A0A6A1" },
+  weekBarSlot: { backgroundColor: "#292D2A" },
+  weekLabel: { color: "#9CA29D" },
+  flowLabel: { color: "#9CA29D" },
+  flowValue: { color: "#F4F5F2" },
+  flowTrack: { backgroundColor: "#292D2A" },
+  netFlow: { borderTopColor: "#303531" },
+  netFlowLabel: { color: "#9CA29D" },
+  trendDirection: { backgroundColor: "#20352E", color: "#82C9B1" },
+  monthWeekSlot: { backgroundColor: "#292D2A" },
+  monthWeekValue: { color: "#F4F5F2" },
+  metricCard: { backgroundColor: "#171A18", borderColor: "#303531" },
+  metricLabel: { color: "#9CA29D" },
+  metricValue: { color: "#F4F5F2" },
+  donutRing: { backgroundColor: "#292D2A" },
+  donutInner: { backgroundColor: "#171A18" },
+  donutLabel: { color: "#969C98" },
+  donutValue: { color: "#F4F5F2" },
+  legendName: { color: "#A4AAA5" },
+  legendValue: { color: "#F4F5F2" },
+  categoryBarName: { color: "#A4AAA5" },
+  categoryBarPercent: { color: "#969C98" },
+  categoryBarValue: { color: "#F4F5F2" },
+  barTrack: { backgroundColor: "#292D2A" },
+  monthCardLabel: { color: "#A4AAA5" },
+  monthCardValue: { color: "#F4F5F2" },
+  notificationCard: { backgroundColor: "#171A18", borderColor: "#303531" },
+  notificationTitle: { color: "#F4F5F2" },
+  notificationCopy: { color: "#969C98" },
+
+  appDialogCard: { backgroundColor: "#191C1A", borderColor: "#343A35" },
+  appDialogTitle: { color: "#F4F5F2" },
+  appDialogMessage: { color: "#A3A9A4" },
+  appDialogButtonCancel: { backgroundColor: "#292D2A", borderColor: "#3A403B" },
+  appDialogButtonTextCancel: { color: "#D2D6D2" },
+  overviewPickerCard: { backgroundColor: "#191C1A", borderColor: "#343A35" },
+  overviewPickerCopy: { color: "#9CA29D" },
+  overviewPickerOption: { backgroundColor: "#232724", borderColor: "#363C37" },
+  overviewPickerOptionActive: { backgroundColor: "#352F40", borderColor: "#A792C5" },
+  overviewPickerLabel: { color: "#F4F5F2" },
+  overviewPickerOptionCopy: { color: "#9CA29D" },
+  calendarCard: { backgroundColor: "#191C1A", borderColor: "#343A35" },
+  calendarEyebrow: { color: "#9CA29D" },
+  calendarTitle: { color: "#F4F5F2" },
+  calendarClose: { backgroundColor: "#292D2A" },
+  calendarArrow: { backgroundColor: "#352F40" },
+  calendarMonthText: { color: "#F4F5F2" },
+  calendarWeekRow: { borderBottomColor: "#343A35" },
+  calendarWeekday: { color: "#9CA29D" },
+  calendarDayText: { color: "#D0D4D0" },
+  calendarTodayButton: { backgroundColor: "#352F40" },
+  calendarTodayText: { color: "#C1AFDC" },
+  editorCard: { backgroundColor: "#191C1A", borderColor: "#343A35" },
+  editorTitle: { color: "#F4F5F2" },
+  editorClose: { backgroundColor: "#292D2A" },
+  editorToggle: { backgroundColor: "#292D2A" },
+  editorInput: { backgroundColor: "#232724", borderColor: "#3A403B", color: "#F4F5F2" },
+  editorAmountWrap: { backgroundColor: "#232724", borderColor: "#3A403B" },
+  editorAmountInput: { color: "#F4F5F2" },
+  categoryChip: { backgroundColor: "#232724", borderColor: "#3A403B" },
+  categoryChipText: { color: "#A3A9A4" },
+
+  tabBar: { backgroundColor: "#171A18", borderColor: "#303531" },
+  homeTabBar: { backgroundColor: "#171A18", borderColor: "#303531", shadowOpacity: .35 },
+  tabText: { color: "#929994" },
+  homeTabTextActive: { color: "#F4F5F2" },
+});
+
+const styles = new Proxy(baseStyles, {
+  get(target, property: string) {
+    const base = target[property as keyof typeof target];
+    const dark = darkStyles[property as keyof typeof darkStyles];
+    return activeThemeDark && dark ? [base, dark] : base;
+  },
+}) as typeof baseStyles;

@@ -1,4 +1,4 @@
-package com.kharcha.expensetracker;
+package com.moneysync.expensetracker;
 
 import android.content.ContentValues;
 import android.content.Context;

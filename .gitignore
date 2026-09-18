@@ -49,3 +49,5 @@ next-env.d.ts
 /android-app/*.png
 /android-app/*.xml
 /android-app/dist-android/
+/MoneySync Signing Backup/
+/Releases/

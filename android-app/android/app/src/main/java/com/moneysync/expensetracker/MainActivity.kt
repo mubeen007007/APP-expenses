@@ -1,4 +1,4 @@
-package com.kharcha.expensetracker
+package com.moneysync.expensetracker
 
 import android.os.Build
 import android.os.Bundle
@@ -20,11 +20,6 @@ class MainActivity : ReactActivity() {
     ExpenseStore.seedPendingBridge(this)
     ExpenseStore.writeRecoverySnapshot(this)
     super.onCreate(null)
-  }
-
-  override fun onResume() {
-    super.onResume()
-    ExpenseStore.writeRecoverySnapshot(this)
   }
 
   /**

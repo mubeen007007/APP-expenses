@@ -1,4 +1,4 @@
-package com.kharcha.expensetracker;
+package com.moneysync.expensetracker;
 
 import android.app.Notification;
 import android.os.Bundle;
@@ -42,8 +42,7 @@ public class GmailNotificationListener extends NotificationListenerService {
 
     String body = content.toString().trim();
     if (body.isEmpty()) return;
-    String lower = (sender + " " + body).toLowerCase(Locale.US);
-    if (!hasAny(lower, "bank", "account", "card", "transaction", "txn", "debit", "credit", "withdraw", "payment", "purchase", "transfer", "spent", "charged", "received", "sent", "salary", "cash")) return;
+    if (TransactionDetector.detect(sender, body) == null) return;
 
     long postedAt = notification.getPostTime();
     String day = new SimpleDateFormat("yyyy-MM-dd", Locale.US).format(new Date(postedAt));
@@ -68,8 +67,4 @@ public class GmailNotificationListener extends NotificationListenerService {
     return value == null ? "" : String.valueOf(value).trim();
   }
 
-  private static boolean hasAny(String text, String... values) {
-    for (String value : values) if (text.contains(value)) return true;
-    return false;
-  }
 }

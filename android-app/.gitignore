@@ -13,6 +13,7 @@ expo-env.d.ts
 .kotlin/
 *.orig.*
 *.jks
+keystore.properties
 *.p8
 *.p12
 *.key
@@ -45,6 +46,7 @@ yarn-error.*
 /android/app/build/
 /android/app/.cxx/
 /android/app/.cxx-failed-build/
+/android/app/.cxx-stale-*/
 /android/app/debug.keystore
 /android/local.properties
 /android/*.log

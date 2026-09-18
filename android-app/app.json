@@ -1,22 +1,22 @@
 {
   "expo": {
-    "name": "Kharcha",
-    "slug": "kharcha",
+    "name": "MoneySync",
+    "slug": "moneysync",
     "scheme": "kharcha",
-    "version": "1.0.0",
+    "version": "2.13.1",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
     "userInterfaceStyle": "light",
     "splash": {
       "image": "./assets/splash-icon.png",
       "resizeMode": "contain",
-      "backgroundColor": "#F5F1E8"
+      "backgroundColor": "#F7F7F4"
     },
     "android": {
-      "package": "com.kharcha.expensetracker",
-      "versionCode": 1,
+      "package": "com.moneysync.expensetracker",
+      "versionCode": 35,
       "adaptiveIcon": {
-        "backgroundColor": "#F5F1E8",
+        "backgroundColor": "#F7F7F4",
         "foregroundImage": "./assets/android-icon-foreground.png",
         "backgroundImage": "./assets/android-icon-background.png",
         "monochromeImage": "./assets/android-icon-monochrome.png"

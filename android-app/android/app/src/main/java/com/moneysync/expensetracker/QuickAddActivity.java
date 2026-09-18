@@ -1,4 +1,4 @@
-package com.kharcha.expensetracker;
+package com.moneysync.expensetracker;
 
 import android.app.Activity;
 import android.graphics.Color;
@@ -144,7 +144,7 @@ public class QuickAddActivity extends Activity {
       return;
     }
     boolean saved = ExpenseStore.add(this, null, label, value, isCredit ? "credit" : "debit", System.currentTimeMillis());
-    Toast.makeText(this, saved ? "Added to Kharcha" : "Could not save", Toast.LENGTH_SHORT).show();
+    Toast.makeText(this, saved ? "Added to MoneySync" : "Could not save", Toast.LENGTH_SHORT).show();
     if (saved) finish();
   }
 

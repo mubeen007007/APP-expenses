@@ -1,4 +1,4 @@
-package com.kharcha.expensetracker;
+package com.moneysync.expensetracker;
 
 import android.app.PendingIntent;
 import android.appwidget.AppWidgetManager;
@@ -30,7 +30,7 @@ public class KharchaWidget extends AppWidgetProvider {
   @Override
   public void onReceive(Context context, Intent intent) {
     super.onReceive(context, intent);
-    if ("com.kharcha.expensetracker.REFRESH_WIDGET".equals(intent.getAction())) {
+    if ("com.moneysync.expensetracker.REFRESH_WIDGET".equals(intent.getAction())) {
       AppWidgetManager manager = AppWidgetManager.getInstance(context);
       int[] ids = manager.getAppWidgetIds(new ComponentName(context, KharchaWidget.class));
       onUpdate(context, manager, ids);
@@ -43,7 +43,7 @@ public class KharchaWidget extends AppWidgetProvider {
     views.setTextViewText(R.id.widget_amount, formatMoney(today));
 
     Intent quickAdd = new Intent(context, QuickAddActivity.class);
-    quickAdd.setAction("com.kharcha.expensetracker.QUICK_ADD");
+    quickAdd.setAction("com.moneysync.expensetracker.QUICK_ADD");
     quickAdd.setData(Uri.parse("kharcha://widget/quick-add/" + widgetId));
     quickAdd.putExtra(AppWidgetManager.EXTRA_APPWIDGET_ID, widgetId);
     quickAdd.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP | Intent.FLAG_ACTIVITY_SINGLE_TOP);
@@ -57,7 +57,7 @@ public class KharchaWidget extends AppWidgetProvider {
     views.setOnClickPendingIntent(R.id.widget_amount, quickPending);
 
     Intent refresh = new Intent(context, KharchaWidget.class);
-    refresh.setAction("com.kharcha.expensetracker.REFRESH_WIDGET");
+    refresh.setAction("com.moneysync.expensetracker.REFRESH_WIDGET");
     PendingIntent refreshPending = PendingIntent.getBroadcast(
       context,
       widgetId + 10000,
