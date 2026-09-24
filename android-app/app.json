@@ -3,7 +3,7 @@
     "name": "MoneySync",
     "slug": "moneysync",
     "scheme": "kharcha",
-    "version": "2.13.1",
+    "version": "2.13.3",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
     "userInterfaceStyle": "light",
@@ -14,7 +14,7 @@
     },
     "android": {
       "package": "com.moneysync.expensetracker",
-      "versionCode": 35,
+      "versionCode": 37,
       "adaptiveIcon": {
         "backgroundColor": "#F7F7F4",
         "foregroundImage": "./assets/android-icon-foreground.png",
@@ -22,7 +22,8 @@
         "monochromeImage": "./assets/android-icon-monochrome.png"
       },
       "permissions": [
-        "POST_NOTIFICATIONS"
+        "POST_NOTIFICATIONS",
+        "RECEIVE_SMS"
       ],
       "predictiveBackGestureEnabled": true
     },

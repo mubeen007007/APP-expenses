@@ -263,8 +263,19 @@ async function syncNativeEntries() {
   return nativeImportInFlight;
 }
 
+async function ensureNotificationChannel() {
+  if (Platform.OS !== "android") return;
+  await Notifications.setNotificationChannelAsync("money-recaps", {
+    name: "Money recaps",
+    description: "Daily MoneySync spending summaries and reminders",
+    importance: Notifications.AndroidImportance.DEFAULT,
+    vibrationPattern: [0, 180],
+  });
+}
+
 async function scheduleReports() {
   if (Platform.OS !== "android") return;
+  await ensureNotificationChannel();
   const permission = await Notifications.getPermissionsAsync();
   if (permission.status !== "granted") return;
   const scheduled = await Notifications.getAllScheduledNotificationsAsync();
@@ -334,6 +345,7 @@ function KharchaApp() {
   const [editType, setEditType] = useState<EntryType>("debit");
   const [editCategory, setEditCategory] = useState("Other");
   const [smsEnabled, setSmsEnabled] = useState(false);
+  const [notificationsEnabled, setNotificationsEnabled] = useState(false);
   const [appDialog, setAppDialog] = useState<AppDialog | null>(null);
   const descriptionRef = useRef<TextInput>(null);
   const amountRef = useRef<TextInput>(null);
@@ -465,6 +477,16 @@ function KharchaApp() {
     );
   }, []);
 
+  const refreshRuntimePermissionStates = useCallback(async () => {
+    if (Platform.OS !== "android") return;
+    const [sms, notifications] = await Promise.all([
+      PermissionsAndroid.check(PermissionsAndroid.PERMISSIONS.RECEIVE_SMS).catch(() => false),
+      Notifications.getPermissionsAsync().catch(() => null),
+    ]);
+    setSmsEnabled(sms);
+    setNotificationsEnabled(notifications?.status === "granted");
+  }, []);
+
   useEffect(() => {
     getDb()
       .then((db) => db.getFirstAsync<{ value: ThemeMode }>("SELECT value FROM settings WHERE key = ?", "theme_mode"))
@@ -513,10 +535,13 @@ function KharchaApp() {
 
   useEffect(() => {
     const subscription = AppState.addEventListener("change", (state) => {
-      if (state === "active") syncAndLoadExpenses().catch(() => undefined);
+      if (state === "active") {
+        syncAndLoadExpenses().catch(() => undefined);
+        refreshRuntimePermissionStates().catch(() => undefined);
+      }
     });
     return () => subscription.remove();
-  }, [syncAndLoadExpenses]);
+  }, [refreshRuntimePermissionStates, syncAndLoadExpenses]);
 
   useEffect(() => {
     const timer = setInterval(() => {
@@ -526,11 +551,8 @@ function KharchaApp() {
   }, [syncAndLoadExpenses]);
 
   useEffect(() => {
-    if (Platform.OS !== "android") return;
-    PermissionsAndroid.check(PermissionsAndroid.PERMISSIONS.RECEIVE_SMS)
-      .then(setSmsEnabled)
-      .catch(() => undefined);
-  }, []);
+    refreshRuntimePermissionStates().catch(() => undefined);
+  }, [refreshRuntimePermissionStates]);
 
   const requestSmsAccess = async () => {
     if (Platform.OS !== "android") return;
@@ -542,10 +564,20 @@ function KharchaApp() {
     });
     const enabled = result === PermissionsAndroid.RESULTS.GRANTED;
     setSmsEnabled(enabled);
+    const permanentlyDenied = result === PermissionsAndroid.RESULTS.NEVER_ASK_AGAIN;
     showDialog(
       enabled ? "SMS capture is on" : "SMS permission is off",
-      enabled ? "SMS and Gmail alerts now work together with duplicate protection." : "You can enable it later from this screen.",
-      undefined,
+      enabled
+        ? "Financial SMS alerts can now be added automatically with duplicate protection."
+        : permanentlyDenied
+          ? "Android will no longer show the SMS prompt. Open MoneySync permissions and allow SMS to enable automatic capture."
+          : "You can enable SMS monitoring later from this screen.",
+      permanentlyDenied
+        ? [
+          { text: "Later", style: "cancel" },
+          { text: "Open settings", onPress: () => Linking.openSettings() },
+        ]
+        : undefined,
       enabled ? "success" : "warning",
     );
   };
@@ -567,7 +599,9 @@ function KharchaApp() {
   };
 
   const requestDailyReports = async () => {
+    await ensureNotificationChannel();
     const result = await Notifications.requestPermissionsAsync();
+    setNotificationsEnabled(result.status === "granted");
     if (result.status === "granted") {
       await scheduleReports();
       showDialog("Daily recap is on", "We’ll remind you at 8:30 PM each evening.", undefined, "success");
@@ -575,6 +609,87 @@ function KharchaApp() {
       showDialog("Notifications are off", "You can enable them later in Android Settings.", undefined, "warning");
     }
   };
+
+  const requestOnboardingNotificationPermission = async () => {
+    await ensureNotificationChannel();
+    const result = await Notifications.requestPermissionsAsync();
+    const enabled = result.status === "granted";
+    setNotificationsEnabled(enabled);
+    if (enabled) await scheduleReports();
+
+    showDialog(
+      "Enable money-alert access",
+      `${enabled ? "MoneySync notifications are enabled. " : "MoneySync notifications were not enabled. "}Android keeps notification-bar access in a separate protected setting. Turn on MoneySync there so eligible bank, wallet, Messages and Gmail alerts can be captured locally.`,
+      [
+        { text: "Later", style: "cancel" },
+        {
+          text: "Open access",
+          onPress: () => Linking.sendIntent("android.settings.ACTION_NOTIFICATION_LISTENER_SETTINGS")
+            .catch(() => Linking.openSettings()),
+        },
+      ],
+      enabled ? "success" : "warning",
+    );
+  };
+
+  const requestOnboardingSmsPermission = async () => {
+    if (Platform.OS !== "android") return;
+    const result = await PermissionsAndroid.request(PermissionsAndroid.PERMISSIONS.RECEIVE_SMS, {
+      title: "Allow financial SMS capture",
+      message: "MoneySync checks new SMS messages for debit and credit alerts on this device. Unrelated messages and OTPs are ignored.",
+      buttonPositive: "Allow",
+      buttonNegative: "Not now",
+    });
+    const enabled = result === PermissionsAndroid.RESULTS.GRANTED;
+    setSmsEnabled(enabled);
+
+    showDialog(
+      enabled ? "SMS capture enabled" : "SMS access not enabled",
+      enabled
+        ? "Financial SMS alerts can now be recorded automatically. Continue to enable MoneySync notifications and notification-bar capture."
+        : "Manual entry still works. You can enable SMS later from Insights. Continue to configure notifications and notification-bar capture.",
+      [
+        { text: "Finish later", style: "cancel" },
+        { text: "Continue", onPress: requestOnboardingNotificationPermission },
+      ],
+      enabled ? "success" : "warning",
+    );
+  };
+
+  const beginPermissionSetup = useCallback(() => {
+    showDialog(
+      "Set up automatic tracking",
+      "MoneySync needs SMS access to detect financial debit and credit alerts, notification permission for daily reports, and notification access to detect eligible banking, wallet, Messages and Gmail alerts. Processing stays on this device. Full messages, OTPs and unrelated content are not stored or shared. Manual entry works without these permissions.",
+      [
+        { text: "Not now", style: "cancel" },
+        { text: "Set up", onPress: requestOnboardingSmsPermission },
+      ],
+      "neutral",
+    );
+  }, [showDialog]);
+
+  useEffect(() => {
+    if (Platform.OS !== "android" || loading || appDialog) return;
+    let cancelled = false;
+    getDb()
+      .then(async (db) => {
+        const seen = await db.getFirstAsync<{ value: string }>(
+          "SELECT value FROM settings WHERE key = ?",
+          "permission_setup_v1",
+        );
+        if (seen || cancelled) return;
+        await db.runAsync(
+          "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
+          "permission_setup_v1",
+          "shown",
+        );
+        if (!cancelled) beginPermissionSetup();
+      })
+      .catch(() => undefined);
+    return () => {
+      cancelled = true;
+    };
+  }, [appDialog, beginPermissionSetup, loading]);
 
   const currentMonth = useMemo(() => {
     const now = new Date();
@@ -1261,8 +1376,8 @@ function KharchaApp() {
 
               <Pressable onPress={requestDailyReports} style={styles.notificationCard}>
                 <View style={styles.notificationIcon}><Ionicons name="notifications-outline" size={21} color={COLORS.purple} /></View>
-                <View style={styles.flex}><Text style={styles.notificationTitle}>Evening money recap</Text><Text style={styles.notificationCopy}>Get a gentle daily reminder at 8:30 PM.</Text></View>
-                <Ionicons name="chevron-forward" size={20} color="#AAA5AD" />
+                <View style={styles.flex}><Text style={styles.notificationTitle}>Evening money recap</Text><Text style={styles.notificationCopy}>{notificationsEnabled ? "On · Daily reminder scheduled for 8:30 PM." : "Off · Tap to allow MoneySync notifications."}</Text></View>
+                <Ionicons name={notificationsEnabled ? "checkmark-circle" : "chevron-forward"} size={20} color={notificationsEnabled ? COLORS.green : "#AAA5AD"} />
               </Pressable>
 
               <Pressable onPress={requestGmailAccess} style={styles.notificationCard}>
