@@ -5,9 +5,9 @@
   android:layout_height="match_parent"
   android:background="@drawable/widget_background"
   android:orientation="vertical"
-  android:paddingLeft="12dp"
+  android:paddingStart="12dp"
   android:paddingTop="8dp"
-  android:paddingRight="12dp"
+  android:paddingEnd="12dp"
   android:paddingBottom="8dp">
 
   <LinearLayout
@@ -27,7 +27,7 @@
     <TextView
       android:layout_width="6dp"
       android:layout_height="6dp"
-      android:layout_marginLeft="7dp"
+      android:layout_marginStart="7dp"
       android:background="@drawable/widget_live_dot"
       android:contentDescription="Active" />
 
@@ -86,7 +86,7 @@
       android:id="@+id/widget_quick_add"
       android:layout_width="0dp"
       android:layout_height="34dp"
-      android:layout_marginLeft="8dp"
+      android:layout_marginStart="8dp"
       android:layout_weight="0.85"
       android:background="@drawable/widget_quick_button"
       android:clickable="true"

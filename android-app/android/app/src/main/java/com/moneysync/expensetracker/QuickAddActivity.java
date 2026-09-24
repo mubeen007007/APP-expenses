@@ -14,6 +14,7 @@ import android.view.inputmethod.InputMethodManager;
 import android.widget.Button;
 import android.widget.EditText;
 import android.widget.LinearLayout;
+import android.widget.ScrollView;
 import android.widget.TextView;
 import android.widget.Toast;
 
@@ -118,7 +119,11 @@ public class QuickAddActivity extends Activity {
     LinearLayout outer = new LinearLayout(this);
     outer.setPadding(dp(8), dp(8), dp(8), dp(8));
     outer.addView(card, new LinearLayout.LayoutParams(-1, -2));
-    setContentView(outer);
+    ScrollView scroll = new ScrollView(this);
+    scroll.setFillViewport(true);
+    scroll.setClipToPadding(false);
+    scroll.addView(outer, new ScrollView.LayoutParams(-1, -2));
+    setContentView(scroll);
 
     WindowManager.LayoutParams windowParams = window.getAttributes();
     int availableWidth = getResources().getDisplayMetrics().widthPixels - dp(24);

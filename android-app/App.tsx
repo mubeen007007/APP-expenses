@@ -967,7 +967,11 @@ function KharchaApp() {
       >
         <Animated.ScrollView
           ref={pageScrollRef}
-          contentContainerStyle={[styles.scroll, tab === "home" && styles.homeScroll]}
+          contentContainerStyle={[
+            styles.scroll,
+            { paddingBottom: 90 + Math.max(insets.bottom, 14) },
+            tab === "home" && styles.homeScroll,
+          ]}
           keyboardShouldPersistTaps="handled"
           scrollEventThrottle={16}
           onScroll={tab === "home" ? Animated.event(
@@ -1759,7 +1763,7 @@ function KharchaApp() {
         </KeyboardAvoidingView>
       </Modal>
 
-      <View style={[styles.tabBar, styles.homeTabBar]}>
+      <View style={[styles.tabBar, styles.homeTabBar, { bottom: Math.max(14, insets.bottom + 8) }]}>
         <TabButton icon="home" label="Home" active={tab === "home"} light={!activeThemeDark} onPress={() => selectTab("home")} />
         <TabButton icon="receipt-outline" label="Activity" active={tab === "activity"} light={!activeThemeDark} onPress={() => selectTab("activity")} />
         <TabButton icon="pie-chart-outline" label="Insights" active={tab === "insights"} light={!activeThemeDark} onPress={() => selectTab("insights")} />
