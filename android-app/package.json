@@ -1,6 +1,6 @@
 {
   "name": "android-app",
-  "version": "2.13.5",
+  "version": "2.13.6",
   "main": "index.ts",
   "dependencies": {
     "@expo/vector-icons": "^15.0.2",

@@ -102,6 +102,8 @@ let nativeImportInFlight: Promise<boolean> | null = null;
 let syncLoadInFlight: Promise<void> | null = null;
 let activeThemeDark = false;
 
+const wait = (milliseconds: number) => new Promise((resolve) => setTimeout(resolve, milliseconds));
+
 const money = (value: number) =>
   `Rs ${new Intl.NumberFormat("en-PK", { maximumFractionDigits: 0 }).format(value)}`;
 
@@ -156,11 +158,15 @@ async function getDb() {
 
   databaseOpenInFlight = (async () => {
     let lastError: unknown;
-    for (let attempt = 0; attempt < 3; attempt += 1) {
+    // Android can reconnect the notification listener at the same moment the
+    // activity starts. Its very short native write may temporarily lock this
+    // file, so give SQLite enough time to settle instead of treating that as a
+    // broken wallet.
+    for (let attempt = 0; attempt < 8; attempt += 1) {
       let candidate: SQLite.SQLiteDatabase | null = null;
       try {
         candidate = await SQLite.openDatabaseAsync("kharcha.db");
-        await candidate.execAsync("PRAGMA busy_timeout = 10000;");
+        await candidate.execAsync("PRAGMA busy_timeout = 15000;");
         try {
           await candidate.execAsync("PRAGMA journal_mode = WAL;");
         } catch (walError) {
@@ -193,7 +199,7 @@ async function getDb() {
             // The failed connection may already be closed.
           }
         }
-        if (attempt < 2) await new Promise((resolve) => setTimeout(resolve, 250 * (attempt + 1)));
+        if (attempt < 7) await wait(Math.min(250 * (attempt + 1), 1500));
       }
     }
     throw lastError;
@@ -439,14 +445,24 @@ function KharchaApp() {
   const syncAndLoadExpenses = useCallback(async () => {
     if (syncLoadInFlight) return syncLoadInFlight;
     syncLoadInFlight = (async () => {
-      try {
-        await syncNativeEntries();
-      } catch (error) {
-        // The recovery and pending files stay on disk. A later foreground
-        // refresh retries them without preventing the wallet from opening.
-        console.warn("MoneySync native sync will retry", error);
+      let lastError: unknown;
+      for (let attempt = 0; attempt < 5; attempt += 1) {
+        try {
+          try {
+            await syncNativeEntries();
+          } catch (error) {
+            // The recovery and pending files stay on disk. Loading the wallet
+            // can still succeed, and another pass will retry the native import.
+            console.warn("MoneySync native sync will retry", error);
+          }
+          await loadExpenses();
+          return;
+        } catch (error) {
+          lastError = error;
+          if (attempt < 4) await wait(300 * (attempt + 1));
+        }
       }
-      await loadExpenses();
+      throw lastError;
     })().finally(() => {
       syncLoadInFlight = null;
     });
