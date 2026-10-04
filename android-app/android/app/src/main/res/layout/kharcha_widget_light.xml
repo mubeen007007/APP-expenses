@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+  android:id="@+id/widget_root"
+  android:layout_width="match_parent"
+  android:layout_height="match_parent"
+  android:background="@drawable/widget_background_light"
+  android:orientation="vertical"
+  android:padding="16dp">
+  <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content" android:gravity="center_vertical" android:orientation="horizontal">
+    <TextView android:id="@+id/widget_brand" android:layout_width="0dp" android:layout_height="wrap_content" android:layout_weight="1" android:text="MoneySync." android:textColor="#17151A" android:textSize="16sp" android:textStyle="bold" />
+    <TextView android:id="@+id/widget_refresh" android:layout_width="40dp" android:layout_height="40dp" android:contentDescription="Refresh totals" android:gravity="center" android:text="&#x21BB;" android:textColor="#666761" android:textSize="23sp" />
+  </LinearLayout>
+  <LinearLayout android:layout_width="match_parent" android:layout_height="0dp" android:layout_marginTop="10dp" android:layout_weight="1" android:background="@drawable/widget_amount_card_light" android:gravity="center_vertical" android:orientation="vertical" android:padding="20dp">
+    <TextView android:id="@+id/widget_label" android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="MONTH BALANCE" android:textColor="#A8D5C3" android:textSize="12sp" android:textStyle="bold" />
+    <TextView android:id="@+id/widget_amount" android:layout_width="match_parent" android:layout_height="wrap_content" android:layout_marginTop="5dp" android:contentDescription="Spent today" android:ellipsize="end" android:maxLines="1" android:text="Rs 0" android:textColor="#FFFFFF" android:textSize="40sp" android:textStyle="bold" />
+    <TextView android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_marginTop="5dp" android:text="Money in minus money out" android:textColor="#B8C6BC" android:textSize="11sp" />
+  </LinearLayout>
+  <LinearLayout android:id="@+id/widget_monthly_block" android:layout_width="match_parent" android:layout_height="62dp" android:layout_marginTop="10dp" android:gravity="center_vertical" android:orientation="horizontal">
+    <LinearLayout android:layout_width="0dp" android:layout_height="match_parent" android:layout_marginEnd="8dp" android:layout_weight="1" android:background="@drawable/widget_month_card_light" android:gravity="center_vertical" android:orientation="vertical" android:paddingStart="14dp" android:paddingEnd="8dp">
+      <TextView android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="SPENT TODAY" android:textColor="#77717B" android:textSize="10sp" android:textStyle="bold" />
+      <TextView android:id="@+id/widget_month_amount" android:layout_width="match_parent" android:layout_height="wrap_content" android:ellipsize="end" android:maxLines="1" android:text="Rs 0" android:textColor="#17151A" android:textSize="18sp" android:textStyle="bold" />
+    </LinearLayout>
+    <TextView android:id="@+id/widget_quick_add" android:layout_width="0dp" android:layout_height="match_parent" android:layout_weight="1" android:background="@drawable/widget_quick_button_light" android:clickable="true" android:contentDescription="Open quick expense entry" android:focusable="true" android:gravity="center" android:text="+  Add expense" android:textColor="#FFFFFF" android:textSize="15sp" android:textStyle="bold" />
+  </LinearLayout>
+</LinearLayout>

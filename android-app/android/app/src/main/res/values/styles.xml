@@ -14,7 +14,7 @@
     <item name="android:windowBackground">@android:color/transparent</item>
     <item name="android:backgroundDimEnabled">true</item>
     <item name="android:backgroundDimAmount">0.72</item>
-    <item name="android:colorAccent">#7C68F2</item>
-    <item name="android:navigationBarColor">#0D0C12</item>
+    <item name="android:colorAccent">#8E79B6</item>
+    <item name="android:navigationBarColor">#0C0E0D</item>
   </style>
 </resources>

@@ -1,4 +1,8 @@
 <resources>
   <string name="app_name">MoneySync</string>
-  <string name="widget_description">Quickly view today’s spending and add a new expense.</string>
+  <string name="widget_description">A roomy MoneySync dashboard with today’s spending, your monthly total, and one-tap quick entry. Resize it to fit your home screen.</string>
+  <string name="widget_label">MoneySync</string>
+    <string name="widget_dashboard_label">MoneySync Dashboard</string>
+    <string name="widget_compact_label">MoneySync Compact</string>
+    <string name="widget_compact_description">A compact four-column MoneySync widget with today’s total and quick entry.</string>
 </resources>

@@ -1,0 +1,70 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+  android:id="@+id/widget_root"
+  android:layout_width="match_parent"
+  android:layout_height="match_parent"
+  android:background="@drawable/widget_background_light"
+  android:gravity="center_vertical"
+  android:orientation="horizontal"
+  android:paddingStart="15dp"
+  android:paddingTop="7dp"
+  android:paddingEnd="12dp"
+  android:paddingBottom="7dp">
+
+  <LinearLayout
+    android:layout_width="0dp"
+    android:layout_height="wrap_content"
+    android:layout_weight="1"
+    android:orientation="vertical">
+    <TextView
+      android:id="@+id/widget_brand"
+      android:layout_width="wrap_content"
+      android:layout_height="wrap_content"
+      android:text="MoneySync."
+      android:textColor="#17151A"
+      android:textSize="11sp"
+      android:textStyle="bold" />
+    <TextView
+      android:id="@+id/widget_amount"
+      android:layout_width="match_parent"
+      android:layout_height="wrap_content"
+      android:contentDescription="Spent today"
+      android:ellipsize="end"
+      android:maxLines="1"
+      android:text="Rs 0"
+      android:textColor="#17151A"
+      android:textSize="21sp"
+      android:textStyle="bold" />
+    <TextView
+      android:id="@+id/widget_label"
+      android:layout_width="wrap_content"
+      android:layout_height="wrap_content"
+      android:text="MONTH BALANCE"
+      android:textColor="#77717B"
+      android:textSize="8sp"
+      android:textStyle="bold" />
+  </LinearLayout>
+
+  <TextView
+    android:id="@+id/widget_refresh"
+    android:layout_width="28dp"
+    android:layout_height="42dp"
+    android:contentDescription="Refresh totals"
+    android:gravity="center"
+    android:text="&#x21BB;"
+    android:textColor="#77717B"
+    android:textSize="18sp" />
+  <TextView
+    android:id="@+id/widget_quick_add"
+    android:layout_width="100dp"
+    android:layout_height="42dp"
+    android:background="@drawable/widget_quick_button_light"
+    android:clickable="true"
+    android:contentDescription="Open quick expense entry"
+    android:focusable="true"
+    android:gravity="center"
+    android:text="+  Add"
+    android:textColor="#FFFFFF"
+    android:textSize="13sp"
+    android:textStyle="bold" />
+</LinearLayout>

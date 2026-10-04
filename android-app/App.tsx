@@ -8,24 +8,28 @@ import { StatusBar } from "expo-status-bar";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Animated,
+  useColorScheme,
   AppState,
+  DeviceEventEmitter,
   Image,
   Keyboard,
   KeyboardAvoidingView,
   Linking,
   Modal,
+  NativeModules,
   PanResponder,
   PermissionsAndroid,
   Platform,
-  Pressable,
   RefreshControl,
   ScrollView,
   StyleSheet,
+  Switch,
   Text,
   TextInput,
   View,
 } from "react-native";
 import { SafeAreaProvider, SafeAreaView, useSafeAreaInsets } from "react-native-safe-area-context";
+import { MotionProvider, MotionView, MotionPressable as Pressable, useReducedMotion } from "./Motion";
 
 Notifications.setNotificationHandler({
   handleNotification: async () => ({
@@ -39,12 +43,16 @@ Notifications.setNotificationHandler({
 type EntryType = "debit" | "credit";
 type Tab = "home" | "activity" | "insights";
 type ThemeMode = "light" | "dark";
+type ThemePreference = ThemeMode | "system";
+type ProfilePurpose = "Personal" | "Business" | "Both";
 type DateScope = "today" | "yesterday" | "custom" | "all";
 type OverviewScope = "today" | "yesterday" | "custom" | "month";
 type CalendarTarget = "activity" | "overview";
 type DialogTone = "neutral" | "success" | "warning" | "danger";
 type DialogAction = { text: string; style?: "cancel" | "destructive"; onPress?: () => void | Promise<void> };
 type AppDialog = { title: string; message: string; tone: DialogTone; actions: DialogAction[] };
+type PlayUpdateInfo = { available: boolean; availableVersionCode: number; flexibleAllowed: boolean; immediateAllowed: boolean; installStatus: string };
+type PlayUpdateState = { installStatus: string; bytesDownloaded: number; totalBytesToDownload: number; errorCode?: number };
 
 type Expense = {
   id: string;
@@ -53,7 +61,15 @@ type Expense = {
   type: EntryType;
   category: string;
   createdAt: string;
+  currency: string;
+  sourceText?: string;
+  sourceSender?: string;
+  sourceChannel?: string;
+  counterparty?: string;
+  account?: string;
+  reference?: string;
 };
+type ReviewEntry = Expense & { duplicateOf: string; source?: string; reviewStatus?: "pending" | "same" | "separate" };
 
 const COLORS = {
   ink: "#111111",
@@ -96,19 +112,147 @@ const categoryMeta: Record<string, { color: string; icon: keyof typeof Ionicons.
 
 const CATEGORY_OPTIONS = Object.keys(categoryMeta).filter((name) => name !== "Income");
 
+function categoryAccent(name: string): string {
+  const color = categoryMeta[name]?.color ?? categoryMeta.Other.color;
+  if (!activeThemeDark) return color;
+  const channels = [1, 3, 5].map((offset) => parseInt(color.slice(offset, offset + 2), 16));
+  return `#${channels.map((channel) => Math.round(channel + (255 - channel) * .38).toString(16).padStart(2, "0")).join("")}`;
+}
+const COMMON_CURRENCIES = ["PKR", "USD", "EUR", "GBP", "AED", "SAR", "INR", "CAD", "AUD", "SGD", "JPY", "CNY", "CHF", "QAR", "KWD", "BHD", "OMR", "MYR", "THB", "BDT", "LKR", "NPR", "NZD", "ZAR", "HKD"];
+const CRYPTO_CURRENCIES = ["USDT", "USDC", "BTC", "ETH", "BNB", "SOL", "XRP", "ADA", "DOGE", "LTC", "TRX", "TON", "DOT", "AVAX", "LINK", "XLM", "BCH", "SHIB", "DAI", "TUSD", "FDUSD"];
+const isCryptoCurrency = (currency: string) => CRYPTO_CURRENCIES.includes(currency.toUpperCase());
+const ONBOARDING_KEY = "onboarding_v2_complete";
+const currencyOptionsForRates = (rates: Record<string, number>) => [
+  ...COMMON_CURRENCIES,
+  ...Object.keys(rates).filter((currency) => !COMMON_CURRENCIES.includes(currency)).sort(),
+];
+type RateSnapshot = { schemaVersion: 2; base: string; rates: Record<string, number>; updatedAt: number };
+
 let database: SQLite.SQLiteDatabase | null = null;
 let databaseOpenInFlight: Promise<SQLite.SQLiteDatabase> | null = null;
 let nativeImportInFlight: Promise<boolean> | null = null;
 let syncLoadInFlight: Promise<void> | null = null;
+let importRecoverySnapshot = false;
 let activeThemeDark = false;
 
 const wait = (milliseconds: number) => new Promise((resolve) => setTimeout(resolve, milliseconds));
 
-const money = (value: number) =>
-  `Rs ${new Intl.NumberFormat("en-PK", { maximumFractionDigits: 0 }).format(value)}`;
+async function shareNativeTheme(theme: ThemePreference) {
+  if (FileSystem.documentDirectory) {
+    await FileSystem.writeAsStringAsync(`${FileSystem.documentDirectory}moneysync_theme.txt`, theme);
+    if (Platform.OS === "android") NativeModules.MoneySyncPermissions?.refreshWidgets?.();
+  }
+}
 
-const shortMoney = (value: number) =>
-  value >= 100000 ? `Rs ${(value / 100000).toFixed(1)}L` : value >= 1000 ? `Rs ${(value / 1000).toFixed(1)}k` : money(value);
+async function shareNativeCurrency(currency: string) {
+  if (FileSystem.documentDirectory) {
+    await FileSystem.writeAsStringAsync(`${FileSystem.documentDirectory}moneysync_currency.txt`, currency);
+  }
+}
+
+async function readRateCache(base: string): Promise<RateSnapshot | null> {
+  if (!FileSystem.documentDirectory) return null;
+  const uri = `${FileSystem.documentDirectory}moneysync_rates_${base}.json`;
+  try {
+    const info = await FileSystem.getInfoAsync(uri);
+    if (!info.exists) return null;
+    const parsed = JSON.parse(await FileSystem.readAsStringAsync(uri)) as RateSnapshot;
+    return parsed.schemaVersion === 2 && parsed.base === base && parsed.rates?.[base] === 1
+      && Number.isFinite(parsed.updatedAt) && parsed.updatedAt > 0 ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+async function fetchRates(base: string): Promise<RateSnapshot> {
+  const cached = await readRateCache(base);
+  if (cached && Date.now() - cached.updatedAt < 24 * 60 * 60 * 1000) return cached;
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 12000);
+    let response: Response;
+    try {
+      response = await fetch(`https://open.er-api.com/v6/latest/${encodeURIComponent(base)}`, { signal: controller.signal });
+    } finally {
+      clearTimeout(timeout);
+    }
+    if (!response.ok) throw new Error(`Rate service returned ${response.status}`);
+    const payload = await response.json() as { result?: string; base_code?: string; rates?: Record<string, number> };
+    if (payload.result !== "success" || payload.base_code !== base || !payload.rates || payload.rates[base] !== 1
+      || Object.values(payload.rates).some((rate) => !Number.isFinite(rate) || rate <= 0)) throw new Error("Invalid rate response");
+    const snapshot: RateSnapshot = { schemaVersion: 2, base, rates: payload.rates, updatedAt: Date.now() };
+    if (FileSystem.documentDirectory) {
+      await FileSystem.writeAsStringAsync(`${FileSystem.documentDirectory}moneysync_rates_${base}.json`, JSON.stringify(snapshot));
+    }
+    return snapshot;
+  } catch (error) {
+    if (cached) return cached;
+    throw error;
+  }
+}
+
+async function preserveDamagedDatabase() {
+  const directory = SQLite.defaultDatabaseDirectory;
+  if (!directory) throw new Error("Wallet directory is unavailable");
+  const base = `file://${directory}/kharcha.db`;
+  const suffix = `.damaged-${Date.now()}`;
+  for (const sidecar of ["", "-wal", "-shm"]) {
+    const source = `${base}${sidecar}`;
+    if ((await FileSystem.getInfoAsync(source)).exists) {
+      await FileSystem.moveAsync({ from: source, to: `${source}${suffix}` });
+    }
+  }
+  importRecoverySnapshot = true;
+}
+
+async function writeRecoverySnapshot(entries: Expense[]) {
+  if (!FileSystem.documentDirectory) return;
+  const db = await getDb();
+  const reviews = await db.getAllAsync<{ payload: string; status: string }>("SELECT payload, status FROM duplicate_reviews");
+  const uri = `${FileSystem.documentDirectory}kharcha_recovery.jsonl`;
+  const content = [...entries.map((entry) => JSON.stringify(entry)),
+    ...reviews.map((row) => JSON.stringify({ ...JSON.parse(row.payload), reviewStatus: row.status }))].join("\n");
+  await FileSystem.writeAsStringAsync(uri, content ? `${content}\n` : "", {
+    encoding: FileSystem.EncodingType.UTF8,
+  });
+}
+
+async function snapshotDatabase(db: SQLite.SQLiteDatabase) {
+  const rows = await db.getAllAsync<{
+    id: string; description: string; amount: number; type: EntryType;
+    category: string; created_at: string; currency: string;
+    source_text: string; source_sender: string; source_channel: string;
+    counterparty: string; account: string; reference: string;
+  }>("SELECT * FROM expenses ORDER BY created_at DESC");
+  await writeRecoverySnapshot(rows.map((row) => ({ ...row, createdAt: row.created_at,
+    sourceText: row.source_text, sourceSender: row.source_sender, sourceChannel: row.source_channel })));
+}
+
+const currencyDigits = (currency: string) => currency === "JPY" ? 0 : ["KWD", "BHD", "OMR"].includes(currency) ? 3 : 2;
+
+const money = (value: number, currency = "PKR", useCurrencyCode = false) => {
+  const digits = currencyDigits(currency);
+  const wholeRupees = currency === "PKR" && Math.abs(value - Math.round(value)) < 0.000001;
+  const number = new Intl.NumberFormat("en-PK", {
+    minimumFractionDigits: wholeRupees ? 0 : digits,
+    maximumFractionDigits: digits,
+  }).format(value);
+  return `${currency === "PKR" && !useCurrencyCode ? "Rs" : currency} ${number}`;
+};
+
+const shortMoney = (value: number, currency = "PKR") => {
+  const prefix = currency === "PKR" ? "Rs" : currency;
+  if (Math.abs(value) >= 1000000) return `${prefix} ${(value / 1000000).toFixed(1)}M`;
+  if (Math.abs(value) >= 1000) return `${prefix} ${(value / 1000).toFixed(1)}k`;
+  return money(value, currency);
+};
+
+const entryDateTime = (value: string) => {
+  const date = new Date(value);
+  const day = date.toLocaleDateString("en-PK", { day: "numeric", month: "short" });
+  const time = date.toLocaleTimeString("en-PK", { hour: "numeric", minute: "2-digit", hour12: true });
+  return `${day}, ${time}`;
+};
 
 const localDateKey = (value: Date | string) => {
   const date = value instanceof Date ? value : new Date(value);
@@ -123,27 +267,38 @@ const dateFromKey = (key: string) => {
   return new Date(year, month - 1, day, 12);
 };
 
+const categoryPatternCache = new Map<string, RegExp>();
+
 function categorize(description: string, type: EntryType) {
   if (type === "credit") return "Income";
   const text = description.toLowerCase();
+  const has = (terms: string[]) => terms.some((term) => {
+    let pattern = categoryPatternCache.get(term);
+    if (!pattern) {
+      pattern = new RegExp(`(^|[^\\p{L}\\p{N}])${term}($|[^\\p{L}\\p{N}])`, "u");
+      categoryPatternCache.set(term, pattern);
+    }
+    return pattern.test(text);
+  });
   const rules: Array<[string, string[]]> = [
-    ["Food", ["lunch", "dinner", "breakfast", "restaurant", "cafe", "coffee", "tea", "pizza", "burger", "biryani", "food"]],
-    ["Groceries", ["grocery", "groceries", "mart", "supermarket", "milk", "vegetable", "fruit"]],
-    ["Transport", ["careem", "uber", "indrive", "ride", "taxi", "fuel", "petrol", "bus", "metro", "parking"]],
+    ["Food", ["foodpanda", "uber eats", "ubereats", "deliveroo", "doordash", "talabat", "grubhub", "just eat", "justeat", "zomato", "swiggy", "lunch", "dinner", "breakfast", "restaurant", "cafe", "coffee", "tea", "pizza", "burger", "biryani", "food", "kfc", "mcdonald", "hardees", "domino", "cheezious"]],
+    ["Groceries", ["grocery", "groceries", "supermarket", "milk", "vegetable", "fruit", "imtiaz", "carrefour", "naheed", "alfatah", "al-fatah"]],
+    ["Transport", ["careem", "uber", "indrive", "bykea", "ride", "taxi", "fuel", "petrol", "shell", "pso", "total parco", "bus", "metro", "parking"]],
     ["Shopping", ["shirt", "dress", "clothes", "clothing", "shoes", "shopping", "daraz", "mall"]],
-    ["Bills", ["bill", "electricity", "internet", "mobile", "gas", "water", "subscription", "netflix"]],
-    ["Home", ["rent", "repair", "furniture", "home", "cleaning"]],
-    ["Health", ["doctor", "medicine", "pharmacy", "hospital", "clinic"]],
     ["Cash", ["atm", "cash withdrawal", "withdrawal", "cash out"]],
     ["Transfers", ["transfer", "ibft", "raast", "sent to", "send to", "advance", "loan", "lent", "borrowed"]],
+    ["Health", ["doctor", "medicine", "pharmacy", "hospital", "clinic"]],
+    ["Bills", ["bill", "electricity", "internet", "mobile bill", "gas bill", "water bill", "subscription", "ptcl", "lesco", "wapda", "jazz", "zong", "telenor", "ufone", "netflix", "spotify"]],
+    ["Home", ["rent", "repair", "furniture", "cleaning"]],
     ["Work", ["office", "client", "work", "business", "freelance", "salary advance"]],
     ["Education", ["school", "college", "university", "tuition", "course", "textbook", "books", "stationery", "exam fee"]],
     ["Entertainment", ["cinema", "movie", "game", "gaming", "concert", "spotify", "youtube premium"]],
     ["Personal", ["salon", "barber", "spa", "gift", "skincare", "cosmetic", "makeup"]],
     ["Travel", ["hotel", "flight", "airline", "booking", "visa", "trip", "airbnb"]],
   ];
-  const matched = rules.find(([, terms]) => terms.some((term) => text.includes(term)))?.[0];
+  const matched = rules.find(([, terms]) => has(terms))?.[0];
   if (matched) return matched;
+  if (has(["mart"])) return "Groceries";
   const words = description.trim().split(/\s+/);
   const looksLikePersonName =
     words.length > 0 &&
@@ -174,6 +329,8 @@ async function getDb() {
           // Android builds briefly hold a native read connection at startup.
           console.warn("MoneySync will continue without changing journal mode", walError);
         }
+        const integrity = await candidate.getFirstAsync<{ quick_check: string }>("PRAGMA quick_check;");
+        if (integrity?.quick_check !== "ok") throw new Error(`Wallet database is malformed: ${integrity?.quick_check}`);
         await candidate.execAsync(`
           CREATE TABLE IF NOT EXISTS expenses (
             id TEXT PRIMARY KEY NOT NULL,
@@ -181,13 +338,34 @@ async function getDb() {
             amount REAL NOT NULL,
             type TEXT NOT NULL,
             category TEXT NOT NULL,
-            created_at TEXT NOT NULL
+            created_at TEXT NOT NULL,
+            currency TEXT NOT NULL DEFAULT 'PKR',
+            source_text TEXT NOT NULL DEFAULT '',
+            source_sender TEXT NOT NULL DEFAULT '',
+            source_channel TEXT NOT NULL DEFAULT '',
+            counterparty TEXT NOT NULL DEFAULT '',
+            account TEXT NOT NULL DEFAULT '',
+            reference TEXT NOT NULL DEFAULT ''
           );
           CREATE TABLE IF NOT EXISTS settings (
             key TEXT PRIMARY KEY NOT NULL,
             value TEXT NOT NULL
           );
+          CREATE TABLE IF NOT EXISTS duplicate_reviews (
+            id TEXT PRIMARY KEY NOT NULL,
+            payload TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending'
+          );
         `);
+        const expenseColumns = await candidate.getAllAsync<{ name: string }>("PRAGMA table_info(expenses)");
+        if (!expenseColumns.some((column) => column.name === "currency")) {
+          await candidate.execAsync("ALTER TABLE expenses ADD COLUMN currency TEXT NOT NULL DEFAULT 'PKR'");
+        }
+        for (const column of ["source_text", "source_sender", "source_channel", "counterparty", "account", "reference"]) {
+          if (!expenseColumns.some((existing) => existing.name === column)) {
+            await candidate.execAsync(`ALTER TABLE expenses ADD COLUMN ${column} TEXT NOT NULL DEFAULT ''`);
+          }
+        }
         database = candidate;
         return candidate;
       } catch (error) {
@@ -198,6 +376,10 @@ async function getDb() {
           } catch {
             // The failed connection may already be closed.
           }
+        }
+        if (/malformed|corrupt/i.test(String(error))) {
+          await preserveDamagedDatabase();
+          console.warn("MoneySync preserved a damaged wallet database and will restore its last snapshot");
         }
         if (attempt < 7) await wait(Math.min(250 * (attempt + 1), 1500));
       }
@@ -225,9 +407,9 @@ async function syncNativeEntries() {
       const content = await FileSystem.readAsStringAsync(uri, { encoding: FileSystem.EncodingType.UTF8 });
       let handled = false;
       for (const line of content.split(/\r?\n/).filter(Boolean)) {
-        let item: Expense;
+        let item: ReviewEntry;
         try {
-          item = JSON.parse(line) as Expense;
+          item = JSON.parse(line) as ReviewEntry;
         } catch {
           continue;
         }
@@ -238,16 +420,27 @@ async function syncNativeEntries() {
           !["debit", "credit"].includes(item.type) ||
           !item.createdAt
         ) continue;
+        if (item.duplicateOf) {
+          await db.runAsync("INSERT OR IGNORE INTO duplicate_reviews (id, payload, status) VALUES (?, ?, ?)",
+            item.id, JSON.stringify(item), ["same", "separate"].includes(item.reviewStatus || "") ? item.reviewStatus! : "pending");
+          handled = true;
+          continue;
+        }
+        // Native automatic imports share a canonical transaction ID across
+        // channels. Never discard real payments merely for equal amount/time.
         // Database errors deliberately escape this function. The file is then
         // retained and retried instead of silently dropping a native entry.
         await db.runAsync(
-          "INSERT OR IGNORE INTO expenses (id, description, amount, type, category, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+          "INSERT OR IGNORE INTO expenses (id, description, amount, type, category, created_at, currency, source_text, source_sender, source_channel, counterparty, account, reference) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
           item.id,
           item.description.slice(0, 120),
           Number(item.amount),
           item.type,
           item.category || categorize(item.description, item.type),
           item.createdAt,
+          (item.currency || "PKR").toUpperCase(),
+          item.sourceText || "", item.sourceSender || "", item.sourceChannel || item.source || "",
+          item.counterparty || "", item.account || "", item.reference || "",
         );
         handled = true;
       }
@@ -255,7 +448,11 @@ async function syncNativeEntries() {
       return handled;
     };
 
-    let imported = await processFile(recoveryUri);
+    let imported = false;
+    if (importRecoverySnapshot) {
+      imported = await processFile(recoveryUri);
+      importRecoverySnapshot = false;
+    }
     imported = (await processFile(processingUri)) || imported;
     const pending = await FileSystem.getInfoAsync(pendingUri);
     if (pending.exists) {
@@ -302,8 +499,8 @@ async function scheduleReports() {
   });
 }
 
-function DonutChart({ categories, total }: { categories: Array<{ name: string; value: number }>; total: number }) {
-  const leadingColor = categoryMeta[categories[0]?.name]?.color ?? COLORS.purple;
+function DonutChart({ categories, total, currency }: { categories: Array<{ name: string; value: number }>; total: number; currency: string }) {
+  const leadingColor = categoryAccent(categories[0]?.name ?? "Other");
   const leadingShare = total ? Math.round(((categories[0]?.value ?? 0) / total) * 100) : 0;
   const leadingIcon = categoryMeta[categories[0]?.name]?.icon ?? "sparkles-outline";
   return (
@@ -318,7 +515,7 @@ function DonutChart({ categories, total }: { categories: Array<{ name: string; v
         </View>
       </View>
       <View style={styles.donutText}>
-        <Text style={styles.donutValue}>{shortMoney(total)}</Text>
+        <Text style={styles.donutValue}>{shortMoney(total, currency)}</Text>
         <Text style={styles.donutLabel}>THIS MONTH</Text>
         <Text style={[styles.donutShare, { color: leadingColor }]}>{leadingShare}% leading</Text>
       </View>
@@ -328,10 +525,42 @@ function DonutChart({ categories, total }: { categories: Array<{ name: string; v
 
 function KharchaApp() {
   const insets = useSafeAreaInsets();
+  const reducedMotion = useReducedMotion();
+  const systemColorScheme = useColorScheme();
+  const systemTheme: ThemeMode = systemColorScheme === "dark" ? "dark" : "light";
   const [tab, setTab] = useState<Tab>("home");
-  const [themeMode, setThemeMode] = useState<ThemeMode>("light");
+  const [themeMode, setThemeMode] = useState<ThemeMode>(systemTheme);
+  const [themePreference, setThemePreference] = useState<ThemePreference>("system");
   activeThemeDark = themeMode === "dark";
+  const [baseCurrency, setBaseCurrency] = useState("PKR");
+  const [currencyConfigured, setCurrencyConfigured] = useState(false);
+  const [currencyPickerVisible, setCurrencyPickerVisible] = useState(false);
+  const [currencySearch, setCurrencySearch] = useState("");
+  const [currencyOptions, setCurrencyOptions] = useState(COMMON_CURRENCIES);
+  const transactionCurrencyOptions = useMemo(() => [...currencyOptions, ...CRYPTO_CURRENCIES], [currencyOptions]);
+  const [profileName, setProfileName] = useState("");
+  const [profilePurpose, setProfilePurpose] = useState<ProfilePurpose>("Personal");
+  const [openingBalance, setOpeningBalance] = useState("");
+  const [settingsNameDraft, setSettingsNameDraft] = useState("");
+  const [settingsPurposeDraft, setSettingsPurposeDraft] = useState<ProfilePurpose>("Personal");
+  const [onboardingVisible, setOnboardingVisible] = useState(false);
+  const [onboardingStep, setOnboardingStep] = useState(0);
+  const [onboardingSaving, setOnboardingSaving] = useState(false);
+  const [onboardingError, setOnboardingError] = useState("");
+  const [settingsVisible, setSettingsVisible] = useState(false);
+  const [settingsCurrencyOpen, setSettingsCurrencyOpen] = useState(false);
+  const [profileSaving, setProfileSaving] = useState(false);
+  const [profileFeedback, setProfileFeedback] = useState("");
+  const [accessFeedback, setAccessFeedback] = useState("");
+  const [rateSnapshot, setRateSnapshot] = useState<RateSnapshot | null>(null);
+  const rates = useMemo(() => rateSnapshot?.base === baseCurrency ? rateSnapshot.rates : { [baseCurrency]: 1 }, [baseCurrency, rateSnapshot]);
+  const ratesUpdatedAt = rateSnapshot?.base === baseCurrency ? rateSnapshot.updatedAt : null;
+  const rateRequestId = useRef(0);
+  const [ratesUnavailable, setRatesUnavailable] = useState(false);
   const [expenses, setExpenses] = useState<Expense[]>([]);
+  const [duplicateReviews, setDuplicateReviews] = useState<ReviewEntry[]>([]);
+  const reviewBusy = useRef(false);
+  const [reviewSaving, setReviewSaving] = useState(false);
   const [description, setDescription] = useState("");
   const [amount, setAmount] = useState("");
   const [entryType, setEntryType] = useState<EntryType>("debit");
@@ -346,19 +575,33 @@ function KharchaApp() {
   const [calendarTarget, setCalendarTarget] = useState<CalendarTarget | null>(null);
   const [calendarMonth, setCalendarMonth] = useState(() => new Date(new Date().getFullYear(), new Date().getMonth(), 1));
   const [editingExpense, setEditingExpense] = useState<Expense | null>(null);
+  const [detailExpense, setDetailExpense] = useState<Expense | null>(null);
   const [editDescription, setEditDescription] = useState("");
   const [editAmount, setEditAmount] = useState("");
+  const [editCurrency, setEditCurrency] = useState("PKR");
   const [editType, setEditType] = useState<EntryType>("debit");
   const [editCategory, setEditCategory] = useState("Other");
   const [smsEnabled, setSmsEnabled] = useState(false);
   const [notificationsEnabled, setNotificationsEnabled] = useState(false);
+  const [dailyRecapEnabled, setDailyRecapEnabled] = useState(false);
+  const [recapChanging, setRecapChanging] = useState(false);
+  const recapChangeInFlight = useRef(false);
+  const [notificationAccessEnabled, setNotificationAccessEnabled] = useState(false);
+  const [permissionsChecked, setPermissionsChecked] = useState(false);
   const [appDialog, setAppDialog] = useState<AppDialog | null>(null);
+  const [playUpdateInfo, setPlayUpdateInfo] = useState<PlayUpdateInfo | null>(null);
+  const [playUpdateState, setPlayUpdateState] = useState<PlayUpdateState | null>(null);
+  const [playUpdateBusy, setPlayUpdateBusy] = useState(false);
+  const updatePromptedVersion = useRef<number | null>(null);
+  const downloadedPrompted = useRef(false);
   const descriptionRef = useRef<TextInput>(null);
   const amountRef = useRef<TextInput>(null);
   const pageScrollRef = useRef<ScrollView>(null);
   const activeTabRef = useRef<Tab>(tab);
   activeTabRef.current = tab;
-  const homeScrollY = useRef(new Animated.Value(0)).current;
+  // Each tab visit owns its scroll animation. Late scroll events from the
+  // previous native view must not collapse a newly opened Home header.
+  const homeScrollY = useMemo(() => new Animated.Value(0), [tab]);
   const homeHeaderHeight = homeScrollY.interpolate({ inputRange: [-140, 0, 210], outputRange: [430, 318, 94], extrapolate: "clamp" });
   const homeHeaderRadius = homeScrollY.interpolate({ inputRange: [0, 210], outputRange: [30, 22], extrapolate: "clamp" });
   const expandedHeaderOpacity = homeScrollY.interpolate({ inputRange: [45, 150], outputRange: [1, 0], extrapolate: "clamp" });
@@ -372,10 +615,73 @@ function KharchaApp() {
     tone: DialogTone = "neutral",
   ) => setAppDialog({ title, message, actions, tone }), []);
 
+  const checkForPlayUpdate = useCallback(async (showCurrent = false) => {
+    if (Platform.OS !== "android" || !NativeModules.MoneySyncUpdates?.checkForUpdate) return;
+    setPlayUpdateBusy(true);
+    try {
+      const info = await NativeModules.MoneySyncUpdates.checkForUpdate() as PlayUpdateInfo;
+      setPlayUpdateInfo(info);
+      if (info.installStatus === "DOWNLOADING" || info.installStatus === "PENDING") {
+        setPlayUpdateState((current) => current ?? { installStatus: info.installStatus, bytesDownloaded: 0, totalBytesToDownload: 0 });
+      }
+      if (info.installStatus === "DOWNLOADED") {
+        setPlayUpdateState((current) => current ?? { installStatus: "DOWNLOADED", bytesDownloaded: 0, totalBytesToDownload: 0 });
+        if (!downloadedPrompted.current) {
+          downloadedPrompted.current = true;
+          showDialog("Update ready to install", "MoneySync has downloaded the update. Restart now to finish installing it?", [
+            { text: "Later", style: "cancel" },
+            { text: "Restart now", onPress: async () => {
+              try { await NativeModules.MoneySyncUpdates.completeUpdate(); }
+              catch { showDialog("Couldn’t install update", "The downloaded update is safe. Please try again from Settings.", undefined, "warning"); }
+            } },
+          ], "success");
+        }
+        return;
+      }
+      if (info.available && (info.flexibleAllowed || info.immediateAllowed) && (showCurrent || updatePromptedVersion.current !== info.availableVersionCode)) {
+        updatePromptedVersion.current = info.availableVersionCode;
+        const flexible = info.flexibleAllowed;
+        showDialog("MoneySync update available", flexible
+          ? "A newer version is ready. Download it in the background while you keep using the app."
+          : "A newer version is ready. Google Play will guide you through installing it now.", [
+          { text: "Later", style: "cancel" },
+          { text: "Update now", onPress: async () => {
+            setPlayUpdateBusy(true);
+            try {
+              const started = await NativeModules.MoneySyncUpdates.startUpdate();
+              if (!started) showDialog("Update unavailable", "Google Play could not start this update. Please try again later.", undefined, "warning");
+            } catch {
+              showDialog("Couldn’t start update", "Open this app from Google Play and try again. Updates are available only for Play-installed copies.", undefined, "warning");
+            } finally { setPlayUpdateBusy(false); }
+          } },
+        ], "neutral");
+      } else if (showCurrent && !info.available) {
+        showDialog("You’re up to date", "You’re using the latest version of MoneySync available on Google Play.", undefined, "success");
+      }
+    } catch {
+      if (showCurrent) showDialog("Couldn’t check for updates", "Connect to the internet and make sure MoneySync was installed from Google Play, then try again.", undefined, "warning");
+    } finally {
+      setPlayUpdateBusy(false);
+    }
+  }, [showDialog]);
+
+  const completePlayUpdate = useCallback(async () => {
+    try {
+      await NativeModules.MoneySyncUpdates.completeUpdate();
+    } catch {
+      showDialog("Couldn’t install update", "The downloaded update is safe. Please try again from Settings.", undefined, "warning");
+    }
+  }, [showDialog]);
+
   const selectTab = useCallback((next: Tab) => {
+    if (next === activeTabRef.current) {
+      pageScrollRef.current?.scrollTo({ y: 0, animated: false });
+      homeScrollY.setValue(0);
+      return;
+    }
+    activeTabRef.current = next;
     setTab(next);
-    pageScrollRef.current?.scrollTo({ y: 0, animated: false });
-  }, []);
+  }, [homeScrollY]);
 
   const tabSwipeResponder = useMemo(() => {
     const finishSwipe = (dx: number, dy: number, velocityX: number) => {
@@ -408,12 +714,146 @@ function KharchaApp() {
   const toggleTheme = useCallback(() => {
     setThemeMode((current) => {
       const next: ThemeMode = current === "light" ? "dark" : "light";
+      setThemePreference(next);
+      shareNativeTheme(next).catch(() => undefined);
       getDb()
         .then((db) => db.runAsync("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", "theme_mode", next))
         .catch(() => undefined);
       return next;
     });
   }, []);
+
+  const selectThemePreference = useCallback(async (preference: ThemePreference) => {
+    setThemePreference(preference);
+    const resolved = preference === "system" ? systemTheme : preference;
+    setThemeMode(resolved);
+    await shareNativeTheme(preference);
+    const db = await getDb();
+    await db.runAsync("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", "theme_mode", preference);
+  }, [systemTheme]);
+
+  useEffect(() => {
+    if (themePreference !== "system") return;
+    setThemeMode(systemTheme);
+    shareNativeTheme("system").catch(() => undefined);
+  }, [systemTheme, themePreference]);
+
+  const updateRates = useCallback(async (currency: string) => {
+    const requestId = ++rateRequestId.current;
+    try {
+      const snapshot = await fetchRates(currency);
+      if (requestId !== rateRequestId.current) return;
+      setRateSnapshot(snapshot);
+      setCurrencyOptions(currencyOptionsForRates(snapshot.rates));
+      setRatesUnavailable(false);
+    } catch {
+      if (requestId !== rateRequestId.current) return;
+      setRateSnapshot(null);
+      setRatesUnavailable(true);
+    }
+  }, []);
+
+  const chooseBaseCurrency = useCallback(async (currency: string) => {
+    const next = currency.toUpperCase();
+    const db = await getDb();
+    await db.runAsync("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", "base_currency", next);
+    await shareNativeCurrency(next).catch((error) => console.warn("Native currency preference will retry", error));
+    setBaseCurrency(next);
+    setCurrencyConfigured(true);
+    setCurrencyPickerVisible(false);
+    setCurrencySearch("");
+    await updateRates(next);
+  }, [updateRates]);
+
+  const saveProfile = useCallback(async () => {
+    const name = profileName.trim();
+    if (!name) throw new Error("Enter your name to continue.");
+    const db = await getDb();
+    await db.runAsync("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", "profile_name", name);
+    await db.runAsync("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", "profile_purpose", profilePurpose);
+    setProfileName(name);
+  }, [profileName, profilePurpose]);
+
+  const finishOnboarding = useCallback(async () => {
+    if (onboardingSaving) return;
+    setOnboardingSaving(true);
+    setOnboardingError("");
+    try {
+      if (!currencyConfigured) throw new Error("Choose your base currency to continue.");
+      await saveProfile();
+      const db = await getDb();
+      const normalizedOpeningBalance = openingBalance.trim().replace(/,/g, "");
+      const openingAmount = normalizedOpeningBalance ? Number(normalizedOpeningBalance) : 0;
+      if (normalizedOpeningBalance && (!Number.isFinite(openingAmount) || openingAmount < 0)) {
+        throw new Error("Enter a valid starting balance, or leave it blank to skip.");
+      }
+      if (openingAmount > 0) {
+        const openingCreatedAt = new Date().toISOString();
+        await db.runAsync(
+          "INSERT OR IGNORE INTO expenses (id, description, amount, type, category, created_at, currency) VALUES (?, ?, ?, ?, ?, ?, ?)",
+          "opening-balance-initial",
+          "Opening balance",
+          openingAmount,
+          "credit",
+          "Other",
+          openingCreatedAt,
+          baseCurrency,
+        );
+        await db.runAsync("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", "opening_balance", String(openingAmount));
+        setExpenses((items) => items.some((item) => item.id === "opening-balance-initial") ? items : [{
+          id: "opening-balance-initial",
+          description: "Opening balance",
+          amount: openingAmount,
+          type: "credit",
+          category: "Other",
+          createdAt: openingCreatedAt,
+          currency: baseCurrency,
+          sourceText: "",
+          sourceSender: "",
+          sourceChannel: "manual",
+        }, ...items]);
+      }
+      await db.runAsync("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", ONBOARDING_KEY, "yes");
+      setOnboardingVisible(false);
+    } catch (error) {
+      setOnboardingError(error instanceof Error ? error.message : "Couldn’t save setup. Please try again.");
+    } finally {
+      setOnboardingSaving(false);
+    }
+  }, [baseCurrency, currencyConfigured, onboardingSaving, openingBalance, saveProfile]);
+
+  const openSettings = () => {
+    setSettingsNameDraft(profileName);
+    setSettingsPurposeDraft(profilePurpose);
+    setProfileFeedback("");
+    setAccessFeedback("");
+    setSettingsCurrencyOpen(false);
+    setCurrencySearch("");
+    setSettingsVisible(true);
+  };
+
+  const saveSettingsProfile = async () => {
+    const name = settingsNameDraft.trim();
+    if (!name) {
+      setProfileFeedback("Enter your name before saving.");
+      return;
+    }
+    setProfileSaving(true);
+    setProfileFeedback("");
+    try {
+      const db = await getDb();
+      await db.runAsync("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", "profile_name", name);
+      await db.runAsync("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", "profile_purpose", settingsPurposeDraft);
+      setProfileName(name);
+      setProfilePurpose(settingsPurposeDraft);
+      setSettingsNameDraft(name);
+      setProfileFeedback("Profile saved on this device.");
+    } catch {
+      setProfileFeedback("Couldn’t save your profile. Please try again.");
+    } finally {
+      setProfileSaving(false);
+    }
+  };
 
   const loadExpenses = useCallback(async () => {
     const db = await getDb();
@@ -424,8 +864,18 @@ function KharchaApp() {
       type: EntryType;
       category: string;
       created_at: string;
+      currency: string;
+      source_text: string; source_sender: string; source_channel: string;
+      counterparty: string; account: string; reference: string;
     }>("SELECT * FROM expenses ORDER BY created_at DESC");
-    const next = rows.map((row) => ({ ...row, createdAt: row.created_at }));
+    const next = rows.map((row) => ({ ...row, currency: row.currency || "PKR", createdAt: row.created_at,
+      sourceText: row.source_text, sourceSender: row.source_sender, sourceChannel: row.source_channel }));
+    const reviews = await db.getAllAsync<{ payload: string }>("SELECT payload FROM duplicate_reviews WHERE status = 'pending' ORDER BY rowid DESC");
+    setDuplicateReviews(reviews.map((row) => {
+      const item = JSON.parse(row.payload) as ReviewEntry;
+      return { ...item, currency: item.currency || "PKR" };
+    }));
+    await writeRecoverySnapshot(next).catch((error) => console.warn("MoneySync snapshot will retry", error));
     setExpenses((current) => {
       if (
         current.length === next.length &&
@@ -436,11 +886,38 @@ function KharchaApp() {
           item.type === next[index]?.type &&
           item.category === next[index]?.category &&
           item.createdAt === next[index]?.createdAt
+          && item.currency === next[index]?.currency
         )
       ) return current;
       return next;
     });
   }, []);
+
+  const resolveDuplicate = async (entry: ReviewEntry, decision: "same" | "separate") => {
+    if (reviewBusy.current) return;
+    reviewBusy.current = true;
+    setReviewSaving(true);
+    try {
+      const db = await getDb();
+      await db.withExclusiveTransactionAsync(async (tx) => {
+        const row = await tx.getFirstAsync<{ status: string }>("SELECT status FROM duplicate_reviews WHERE id = ?", entry.id);
+        if (row?.status !== "pending") return;
+        if (decision === "separate") {
+          await tx.runAsync("INSERT OR IGNORE INTO expenses (id, description, amount, type, category, created_at, currency, source_text, source_sender, source_channel, counterparty, account, reference) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            entry.id, entry.description, entry.amount, entry.type, entry.category || categorize(entry.description, entry.type), entry.createdAt, entry.currency || "PKR",
+            entry.sourceText || "", entry.sourceSender || "", entry.sourceChannel || entry.source || "",
+            entry.counterparty || "", entry.account || "", entry.reference || "");
+        }
+        await tx.runAsync("UPDATE duplicate_reviews SET status = ? WHERE id = ?", decision, entry.id);
+      });
+      await loadExpenses();
+    } catch {
+      showDialog("Couldn’t save your choice", "Please try again. The alert remains available for review.", undefined, "warning");
+    } finally {
+      reviewBusy.current = false;
+      setReviewSaving(false);
+    }
+  };
 
   const syncAndLoadExpenses = useCallback(async () => {
     if (syncLoadInFlight) return syncLoadInFlight;
@@ -473,7 +950,7 @@ function KharchaApp() {
     const db = await getDb();
     const marker = await db.getFirstAsync<{ value: string }>(
       "SELECT value FROM settings WHERE key = ?",
-      "smart_categories_v1",
+      "smart_categories_v2",
     );
     if (marker) return;
     const rows = await db.getAllAsync<{ id: string; description: string; type: EntryType }>(
@@ -488,28 +965,67 @@ function KharchaApp() {
     }
     await db.runAsync(
       "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
-      "smart_categories_v1",
+      "smart_categories_v2",
       "complete",
     );
   }, []);
 
   const refreshRuntimePermissionStates = useCallback(async () => {
     if (Platform.OS !== "android") return;
-    const [sms, notifications] = await Promise.all([
+    const [sms, notifications, listener, scheduled] = await Promise.all([
       PermissionsAndroid.check(PermissionsAndroid.PERMISSIONS.RECEIVE_SMS).catch(() => false),
       Notifications.getPermissionsAsync().catch(() => null),
+      NativeModules.MoneySyncPermissions.hasNotificationAccess().catch(() => false),
+      Notifications.getAllScheduledNotificationsAsync().catch(() => []),
     ]);
     setSmsEnabled(sms);
     setNotificationsEnabled(notifications?.status === "granted");
+    setDailyRecapEnabled(notifications?.status === "granted" && scheduled.some((item) => item.identifier === "kharcha-daily"));
+    setNotificationAccessEnabled(listener === true);
+    setPermissionsChecked(true);
   }, []);
 
   useEffect(() => {
     getDb()
       .then((db) => db.getFirstAsync<{ value: ThemeMode }>("SELECT value FROM settings WHERE key = ?", "theme_mode"))
       .then((saved) => {
-        if (saved?.value === "dark" || saved?.value === "light") setThemeMode(saved.value);
+        if (saved?.value === "dark" || saved?.value === "light") {
+          setThemePreference(saved.value);
+          setThemeMode(saved.value);
+          shareNativeTheme(saved.value).catch(() => undefined);
+        } else {
+          setThemePreference("system");
+          setThemeMode(systemTheme);
+          shareNativeTheme("system").catch(() => undefined);
+        }
       })
       .catch(() => undefined);
+
+    getDb()
+      .then(async (db) => {
+        const [saved, name, purpose, completed] = await Promise.all([
+          db.getFirstAsync<{ value: string }>("SELECT value FROM settings WHERE key = ?", "base_currency"),
+          db.getFirstAsync<{ value: string }>("SELECT value FROM settings WHERE key = ?", "profile_name"),
+          db.getFirstAsync<{ value: string }>("SELECT value FROM settings WHERE key = ?", "profile_purpose"),
+          db.getFirstAsync<{ value: string }>("SELECT value FROM settings WHERE key = ?", ONBOARDING_KEY),
+        ]);
+        setProfileName(name?.value ?? "");
+        if (purpose?.value === "Business" || purpose?.value === "Both") setProfilePurpose(purpose.value);
+        const currency = saved?.value?.toUpperCase();
+        if (currency && /^[A-Z]{3}$/.test(currency)) {
+          setBaseCurrency(currency);
+          setCurrencyConfigured(true);
+          shareNativeCurrency(currency).catch(() => undefined);
+          updateRates(currency).catch(() => undefined);
+        } else {
+          setCurrencyConfigured(false);
+          fetchRates("USD").then((snapshot) => {
+            setCurrencyOptions(currencyOptionsForRates(snapshot.rates));
+          }).catch(() => undefined);
+        }
+        if (completed?.value !== "yes") setOnboardingVisible(true);
+      })
+      .catch((error) => console.warn("MoneySync setup will retry", error));
 
     upgradeSmartCategories()
       .catch((error) => console.warn("Smart category upgrade will retry", error))
@@ -547,17 +1063,39 @@ function KharchaApp() {
       responseSub.remove();
       linkSub.remove();
     };
-  }, [showDialog, syncAndLoadExpenses, upgradeSmartCategories]);
+  }, [showDialog, syncAndLoadExpenses, updateRates, upgradeSmartCategories]);
 
   useEffect(() => {
     const subscription = AppState.addEventListener("change", (state) => {
       if (state === "active") {
         syncAndLoadExpenses().catch(() => undefined);
         refreshRuntimePermissionStates().catch(() => undefined);
+        checkForPlayUpdate(false).catch(() => undefined);
       }
     });
     return () => subscription.remove();
-  }, [refreshRuntimePermissionStates, syncAndLoadExpenses]);
+  }, [checkForPlayUpdate, refreshRuntimePermissionStates, syncAndLoadExpenses]);
+
+  useEffect(() => {
+    if (Platform.OS !== "android" || loading || onboardingVisible) return;
+    const timer = setTimeout(() => checkForPlayUpdate(false).catch(() => undefined), 1800);
+    const statusSub = DeviceEventEmitter.addListener("MoneySyncUpdateStatus", (status: PlayUpdateState) => {
+      setPlayUpdateState(status);
+      if (status.installStatus === "DOWNLOADED" && !downloadedPrompted.current) {
+        downloadedPrompted.current = true;
+        showDialog("Update ready to install", "MoneySync has downloaded the update. Restart now to finish installing it?", [
+          { text: "Later", style: "cancel" },
+          { text: "Restart now", onPress: completePlayUpdate },
+        ], "success");
+      } else if (status.installStatus === "FAILED") {
+        showDialog("Update couldn’t download", "Google Play could not finish downloading the update. You can try again from Settings.", undefined, "warning");
+      }
+    });
+    return () => {
+      clearTimeout(timer);
+      statusSub.remove();
+    };
+  }, [checkForPlayUpdate, completePlayUpdate, loading, onboardingVisible, showDialog]);
 
   useEffect(() => {
     const timer = setInterval(() => {
@@ -601,7 +1139,7 @@ function KharchaApp() {
   const requestGmailAccess = () => {
     showDialog(
       "Enable notification-bar capture",
-      "On the next screen, turn on notification access for MoneySync. It will detect PKR/Rs debit and credit alerts from Gmail, Messages, banking and wallet apps without storing the full notification text.",
+      "On the next screen, turn on notification access for MoneySync. It will detect supported-currency debit and credit alerts from Gmail, Messages, banking and wallet apps without storing the full notification text.",
       [
         { text: "Cancel", style: "cancel" },
         {
@@ -620,92 +1158,117 @@ function KharchaApp() {
     setNotificationsEnabled(result.status === "granted");
     if (result.status === "granted") {
       await scheduleReports();
+      setDailyRecapEnabled(true);
       showDialog("Daily recap is on", "We’ll remind you at 8:30 PM each evening.", undefined, "success");
     } else {
-      showDialog("Notifications are off", "You can enable them later in Android Settings.", undefined, "warning");
+      showDialog("Notifications are off", "Allow notifications in Android Settings to receive daily recaps.", [
+        { text: "Later", style: "cancel" },
+        { text: "Open settings", onPress: () => Linking.openSettings() },
+      ], "warning");
     }
   };
 
-  const requestOnboardingNotificationPermission = async () => {
-    await ensureNotificationChannel();
-    const result = await Notifications.requestPermissionsAsync();
-    const enabled = result.status === "granted";
-    setNotificationsEnabled(enabled);
-    if (enabled) await scheduleReports();
-
-    showDialog(
-      "Enable money-alert access",
-      `${enabled ? "MoneySync notifications are enabled. " : "MoneySync notifications were not enabled. "}Android keeps notification-bar access in a separate protected setting. Turn on MoneySync there so eligible bank, wallet, Messages and Gmail alerts can be captured locally.`,
-      [
-        { text: "Later", style: "cancel" },
-        {
-          text: "Open access",
-          onPress: () => Linking.sendIntent("android.settings.ACTION_NOTIFICATION_LISTENER_SETTINGS")
-            .catch(() => Linking.openSettings()),
-        },
-      ],
-      enabled ? "success" : "warning",
-    );
+  const toggleDailyReports = async () => {
+    if (recapChangeInFlight.current) return;
+    recapChangeInFlight.current = true;
+    setRecapChanging(true);
+    try {
+      if (dailyRecapEnabled) {
+        await Notifications.cancelScheduledNotificationAsync("kharcha-daily");
+        setDailyRecapEnabled(false);
+      } else {
+        await requestDailyReports();
+      }
+    } catch {
+      showDialog("Couldn’t update recap", "Please try again. Your other notification settings have not been changed.", undefined, "warning");
+    } finally {
+      recapChangeInFlight.current = false;
+      setRecapChanging(false);
+    }
   };
 
-  const requestOnboardingSmsPermission = async () => {
+  const requestSetupSmsAccess = async () => {
     if (Platform.OS !== "android") return;
-    const result = await PermissionsAndroid.request(PermissionsAndroid.PERMISSIONS.RECEIVE_SMS, {
-      title: "Allow financial SMS capture",
-      message: "MoneySync checks new SMS messages for debit and credit alerts on this device. Unrelated messages and OTPs are ignored.",
-      buttonPositive: "Allow",
-      buttonNegative: "Not now",
-    });
-    const enabled = result === PermissionsAndroid.RESULTS.GRANTED;
-    setSmsEnabled(enabled);
-
-    showDialog(
-      enabled ? "SMS capture enabled" : "SMS access not enabled",
-      enabled
-        ? "Financial SMS alerts can now be recorded automatically. Continue to enable MoneySync notifications and notification-bar capture."
-        : "Manual entry still works. You can enable SMS later from Insights. Continue to configure notifications and notification-bar capture.",
-      [
-        { text: "Finish later", style: "cancel" },
-        { text: "Continue", onPress: requestOnboardingNotificationPermission },
-      ],
-      enabled ? "success" : "warning",
-    );
+    setAccessFeedback("");
+    try {
+      const result = await PermissionsAndroid.request(PermissionsAndroid.PERMISSIONS.RECEIVE_SMS, {
+        title: "Allow financial SMS capture",
+        message: "MoneySync checks new SMS messages for debit and credit alerts on this device. Unrelated messages and OTPs are ignored.",
+        buttonPositive: "Allow",
+        buttonNegative: "Not now",
+      });
+      setSmsEnabled(result === PermissionsAndroid.RESULTS.GRANTED);
+      if (result === PermissionsAndroid.RESULTS.NEVER_ASK_AGAIN) {
+        setAccessFeedback("Android blocked another SMS prompt. Allow SMS in MoneySync's app settings.");
+        await Linking.openSettings();
+      }
+    } catch {
+      setAccessFeedback("Couldn’t request SMS access. Try again from Settings.");
+    }
   };
 
-  const beginPermissionSetup = useCallback(() => {
-    showDialog(
-      "Set up automatic tracking",
-      "MoneySync needs SMS access to detect financial debit and credit alerts, notification permission for daily reports, and notification access to detect eligible banking, wallet, Messages and Gmail alerts. Processing stays on this device. Full messages, OTPs and unrelated content are not stored or shared. Manual entry works without these permissions.",
-      [
-        { text: "Not now", style: "cancel" },
-        { text: "Set up", onPress: requestOnboardingSmsPermission },
-      ],
-      "neutral",
-    );
-  }, [showDialog]);
+  const requestSetupNotifications = async () => {
+    setAccessFeedback("");
+    try {
+      await ensureNotificationChannel();
+      const current = await Notifications.getPermissionsAsync();
+      if (current.status !== "granted" && !current.canAskAgain) {
+        setAccessFeedback("Allow MoneySync notifications in Android settings.");
+        await Linking.openSettings();
+        return;
+      }
+      const result = await Notifications.requestPermissionsAsync();
+      setNotificationsEnabled(result.status === "granted");
+      if (result.status !== "granted") setAccessFeedback("Notifications are off. You can enable them later in Settings.");
+    } catch {
+      setAccessFeedback("Couldn’t request notifications. Try again from Settings.");
+    }
+  };
 
-  useEffect(() => {
-    if (Platform.OS !== "android" || loading || appDialog) return;
-    let cancelled = false;
-    getDb()
-      .then(async (db) => {
-        const seen = await db.getFirstAsync<{ value: string }>(
-          "SELECT value FROM settings WHERE key = ?",
-          "permission_setup_v1",
-        );
-        if (seen || cancelled) return;
-        await db.runAsync(
-          "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
-          "permission_setup_v1",
-          "shown",
-        );
-        if (!cancelled) beginPermissionSetup();
-      })
-      .catch(() => undefined);
-    return () => {
-      cancelled = true;
+  const openAlertAccessSettings = async () => {
+    setAccessFeedback("Turn on MoneySync notification access, then return here. The status will update automatically.");
+    try {
+      await Linking.sendIntent("android.settings.ACTION_NOTIFICATION_LISTENER_SETTINGS");
+    } catch {
+      await Linking.openSettings();
+    }
+  };
+
+  const amountInBase = useCallback((item: Expense) => {
+    const source = (item.currency || "PKR").toUpperCase();
+    if (source === baseCurrency) return item.amount;
+    const sourcePerBase = rates[source];
+    return Number.isFinite(sourcePerBase) && sourcePerBase > 0 ? item.amount / sourcePerBase : 0;
+  }, [baseCurrency, rates]);
+
+  const transactionDisplay = (item: Expense) => {
+    const originalCurrency = (item.currency || "PKR").toUpperCase();
+    if (!currencyOptions.includes(originalCurrency) && !isCryptoCurrency(originalCurrency)) return {
+      amount: `${baseCurrency} —`, original: "Currency needs review · amount preserved", converted: null,
     };
-  }, [appDialog, beginPermissionSetup, loading]);
+    if (originalCurrency === baseCurrency) return { amount: money(item.amount, baseCurrency, true), original: "", converted: item.amount };
+    const original = `Original: ${money(item.amount, originalCurrency, true)}`;
+    if (!(rates[originalCurrency] > 0)) return {
+      amount: isCryptoCurrency(originalCurrency) ? money(item.amount, originalCurrency, true) : `${baseCurrency} —`,
+      original: isCryptoCurrency(originalCurrency) ? "Crypto amount · no fiat conversion" : original,
+      converted: null,
+    };
+    return {
+      amount: `≈ ${money(amountInBase(item), baseCurrency, true)}`,
+      original,
+      converted: amountInBase(item),
+    };
+  };
+
+  const unconvertedCurrencies = useMemo(() => [...new Set(expenses
+    .map((item) => (item.currency || "PKR").toUpperCase())
+    .filter((currency) => (currencyOptions.includes(currency) || isCryptoCurrency(currency))
+      && currency !== baseCurrency && !(rates[currency] > 0)))], [baseCurrency, expenses, rates, currencyOptions]);
+  const invalidCurrencyCount = useMemo(() => expenses.filter((item) =>
+    !currencyOptions.includes((item.currency || "PKR").toUpperCase())
+      && !isCryptoCurrency(item.currency || "PKR")).length, [expenses, currencyOptions]);
+  const visibleCurrencies = useMemo(() => currencyOptions.filter((currency) =>
+    !currencySearch.trim() || currency.includes(currencySearch.trim().toUpperCase())), [currencyOptions, currencySearch]);
 
   const currentMonth = useMemo(() => {
     const now = new Date();
@@ -716,10 +1279,10 @@ function KharchaApp() {
   }, [expenses]);
 
   const totals = useMemo(() => {
-    const credits = currentMonth.filter((item) => item.type === "credit").reduce((sum, item) => sum + item.amount, 0);
-    const debits = currentMonth.filter((item) => item.type === "debit").reduce((sum, item) => sum + item.amount, 0);
+    const credits = currentMonth.filter((item) => item.type === "credit").reduce((sum, item) => sum + amountInBase(item), 0);
+    const debits = currentMonth.filter((item) => item.type === "debit").reduce((sum, item) => sum + amountInBase(item), 0);
     return { credits, debits, balance: credits - debits };
-  }, [currentMonth]);
+  }, [amountInBase, currentMonth]);
 
   const overviewExpenses = useMemo(() => {
     if (overviewScope === "month") return currentMonth;
@@ -733,10 +1296,10 @@ function KharchaApp() {
   }, [currentMonth, expenses, overviewDateKey, overviewScope]);
 
   const overviewTotals = useMemo(() => {
-    const credits = overviewExpenses.filter((item) => item.type === "credit").reduce((sum, item) => sum + item.amount, 0);
-    const debits = overviewExpenses.filter((item) => item.type === "debit").reduce((sum, item) => sum + item.amount, 0);
+    const credits = overviewExpenses.filter((item) => item.type === "credit").reduce((sum, item) => sum + amountInBase(item), 0);
+    const debits = overviewExpenses.filter((item) => item.type === "debit").reduce((sum, item) => sum + amountInBase(item), 0);
     return { credits, debits, balance: credits - debits };
-  }, [overviewExpenses]);
+  }, [amountInBase, overviewExpenses]);
 
   const overviewLabel = overviewScope === "month"
     ? "MONTH"
@@ -756,16 +1319,16 @@ function KharchaApp() {
 
   const categories = useMemo(() => {
     const values = new Map<string, number>();
-    currentMonth.filter((item) => item.type === "debit").forEach((item) => values.set(item.category, (values.get(item.category) ?? 0) + item.amount));
+    currentMonth.filter((item) => item.type === "debit").forEach((item) => values.set(item.category, (values.get(item.category) ?? 0) + amountInBase(item)));
     return [...values.entries()].map(([name, value]) => ({ name, value })).sort((a, b) => b.value - a.value);
-  }, [currentMonth]);
+  }, [amountInBase, currentMonth]);
 
   const todayTotal = useMemo(() => {
     const today = new Date().toDateString();
     return expenses
       .filter((item) => item.type === "debit" && new Date(item.createdAt).toDateString() === today)
-      .reduce((sum, item) => sum + item.amount, 0);
-  }, [expenses]);
+      .reduce((sum, item) => sum + amountInBase(item), 0);
+  }, [amountInBase, expenses]);
 
   const lastSevenDays = useMemo(() => {
     const result: Array<{ key: string; label: string; value: number }> = [];
@@ -775,7 +1338,7 @@ function KharchaApp() {
       const key = day.toDateString();
       const value = expenses
         .filter((item) => item.type === "debit" && new Date(item.createdAt).toDateString() === key)
-        .reduce((sum, item) => sum + item.amount, 0);
+        .reduce((sum, item) => sum + amountInBase(item), 0);
       result.push({
         key,
         label: day.toLocaleDateString("en-PK", { weekday: "short" }).slice(0, 2),
@@ -783,7 +1346,7 @@ function KharchaApp() {
       });
     }
     return result;
-  }, [expenses]);
+  }, [amountInBase, expenses]);
 
   const monthlyWeeks = useMemo(() => {
     const result = [0, 0, 0, 0, 0];
@@ -791,15 +1354,15 @@ function KharchaApp() {
       .filter((item) => item.type === "debit")
       .forEach((item) => {
         const week = Math.min(4, Math.floor((new Date(item.createdAt).getDate() - 1) / 7));
-        result[week] += item.amount;
+        result[week] += amountInBase(item);
       });
     return result.map((value, index) => ({ label: `W${index + 1}`, value }));
-  }, [currentMonth]);
+  }, [amountInBase, currentMonth]);
 
   const insightMetrics = useMemo(() => {
     const debits = currentMonth.filter((item) => item.type === "debit");
     const activeDays = new Set(debits.map((item) => new Date(item.createdAt).toDateString())).size;
-    const largest = debits.reduce((max, item) => Math.max(max, item.amount), 0);
+    const largest = debits.reduce((max, item) => Math.max(max, amountInBase(item)), 0);
     const elapsedDays = Math.max(1, new Date().getDate());
     const savingsRate = totals.credits > 0 ? ((totals.credits - totals.debits) / totals.credits) * 100 : 0;
     return {
@@ -808,7 +1371,7 @@ function KharchaApp() {
       activeDays,
       savingsRate,
     };
-  }, [currentMonth, totals]);
+  }, [amountInBase, currentMonth, totals]);
 
   const selectedDateKey = useMemo(() => {
     if (dateScope === "custom") return customDateKey;
@@ -823,10 +1386,10 @@ function KharchaApp() {
   );
 
   const filteredTotals = useMemo(() => {
-    const credits = filteredExpenses.filter((item) => item.type === "credit").reduce((sum, item) => sum + item.amount, 0);
-    const debits = filteredExpenses.filter((item) => item.type === "debit").reduce((sum, item) => sum + item.amount, 0);
+    const credits = filteredExpenses.filter((item) => item.type === "credit").reduce((sum, item) => sum + amountInBase(item), 0);
+    const debits = filteredExpenses.filter((item) => item.type === "debit").reduce((sum, item) => sum + amountInBase(item), 0);
     return { credits, debits };
-  }, [filteredExpenses]);
+  }, [amountInBase, filteredExpenses]);
 
   const calendarDays = useMemo(() => {
     const year = calendarMonth.getFullYear();
@@ -854,18 +1417,21 @@ function KharchaApp() {
       type: entryType,
       category: categorize(description, entryType),
       createdAt: new Date().toISOString(),
+      currency: baseCurrency,
     };
     try {
       const db = await getDb();
       await db.runAsync(
-        "INSERT INTO expenses (id, description, amount, type, category, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+        "INSERT INTO expenses (id, description, amount, type, category, created_at, currency) VALUES (?, ?, ?, ?, ?, ?, ?)",
         entry.id,
         entry.description,
         entry.amount,
         entry.type,
         entry.category,
         entry.createdAt,
+        entry.currency,
       );
+      await snapshotDatabase(db).catch((error) => console.warn("MoneySync snapshot will retry", error));
       setExpenses((items) => [entry, ...items]);
       setDescription("");
       setAmount("");
@@ -885,6 +1451,7 @@ function KharchaApp() {
           try {
             const db = await getDb();
             await db.runAsync("DELETE FROM expenses WHERE id = ?", entry.id);
+            await snapshotDatabase(db).catch((error) => console.warn("MoneySync snapshot will retry", error));
             setExpenses((items) => items.filter((item) => item.id !== entry.id));
           } catch {
             showDialog("Couldn’t remove entry", "Nothing was changed. Please try again.", undefined, "danger");
@@ -898,6 +1465,8 @@ function KharchaApp() {
     setEditingExpense(entry);
     setEditDescription(entry.description);
     setEditAmount(String(entry.amount));
+    const savedCurrency = (entry.currency || baseCurrency).toUpperCase();
+    setEditCurrency(currencyOptions.includes(savedCurrency) || isCryptoCurrency(savedCurrency) ? savedCurrency : baseCurrency);
     setEditType(entry.type);
     setEditCategory(entry.category);
   };
@@ -913,19 +1482,22 @@ function KharchaApp() {
       ...editingExpense,
       description: editDescription.trim().slice(0, 120),
       amount: parsed,
+      currency: editCurrency,
       type: editType,
       category: editType === "credit" ? "Income" : editCategory,
     };
     try {
       const db = await getDb();
       await db.runAsync(
-        "UPDATE expenses SET description = ?, amount = ?, type = ?, category = ? WHERE id = ?",
+        "UPDATE expenses SET description = ?, amount = ?, currency = ?, type = ?, category = ? WHERE id = ?",
         updated.description,
         updated.amount,
+        updated.currency,
         updated.type,
         updated.category,
         updated.id,
       );
+      await snapshotDatabase(db).catch((error) => console.warn("MoneySync snapshot will retry", error));
       setExpenses((items) => items.map((item) => item.id === updated.id ? updated : item));
       setEditingExpense(null);
       Keyboard.dismiss();
@@ -940,8 +1512,20 @@ function KharchaApp() {
       return;
     }
     const rows = [
-      ["Date", "Description", "Category", "Type", "Amount"],
-      ...expenses.map((item) => [item.createdAt, item.description, item.category, item.type, String(item.amount)]),
+      ["Date", "Description", "Category", "Type", "Amount", "Currency", "Original Amount", "Original Currency"],
+      ...expenses.map((item) => {
+        const display = transactionDisplay(item);
+        return [
+          item.createdAt,
+          `${item.description}${display.original ? ` · ${display.original}` : ""}`,
+          item.category,
+          item.type,
+          display.converted === null ? "" : display.converted.toFixed(currencyDigits(baseCurrency)),
+          baseCurrency,
+          String(item.amount),
+          item.currency || "PKR",
+        ];
+      }),
     ];
     const csv = rows.map((row) => row.map((cell) => `"${cell.replaceAll('"', '""')}"`).join(",")).join("\n");
     const uri = `${FileSystem.cacheDirectory}moneysync-expenses.csv`;
@@ -957,21 +1541,92 @@ function KharchaApp() {
 
   const renderTransaction = (item: Expense) => {
     const meta = categoryMeta[item.category] ?? categoryMeta.Other;
+    const display = transactionDisplay(item);
     return (
-      <Pressable key={item.id} onPress={() => openEditor(item)} onLongPress={() => removeEntry(item)} style={styles.transaction}>
-        <View style={[styles.transactionIcon, { backgroundColor: `${meta.color}18` }]}>
-          <Ionicons name={meta.icon} color={meta.color} size={19} />
+      <Pressable key={item.id} onPress={() => setDetailExpense(item)} onLongPress={() => removeEntry(item)} style={styles.transaction}>
+        <View style={[styles.transactionIcon, { backgroundColor: `${categoryAccent(item.category)}28` }]}>
+          <Ionicons name={meta.icon} color={categoryAccent(item.category)} size={19} />
         </View>
         <View style={styles.transactionText}>
           <Text numberOfLines={1} style={styles.transactionTitle}>{item.description}</Text>
-          <Text style={styles.transactionMeta}>{item.category} · {new Date(item.createdAt).toLocaleDateString("en-PK", { day: "numeric", month: "short" })}</Text>
+          {display.original ? <Text style={styles.transactionOriginal}>{display.original}</Text> : null}
+          <Text style={styles.transactionMeta}>{item.category} · {entryDateTime(item.createdAt)}</Text>
         </View>
         <Text style={[styles.transactionAmount, item.type === "credit" && styles.creditAmount]}>
-          {item.type === "credit" ? "+" : "−"} {money(item.amount)}
+          {item.type === "credit" ? "+" : "−"} {display.amount}
         </Text>
       </Pressable>
     );
   };
+
+  const missingPermissions = [
+    ...(!smsEnabled ? [{ label: "Enable SMS", action: requestSmsAccess }] : []),
+    ...(!notificationsEnabled ? [{ label: "Enable notifications", action: requestDailyReports }] : []),
+    ...(!notificationAccessEnabled ? [{ label: "Enable alert access", action: requestGmailAccess }] : []),
+  ];
+  const permissionBanner = Platform.OS === "android" && permissionsChecked && missingPermissions.length > 0 ? (
+    <View accessibilityLiveRegion="polite" style={{ padding: 14, marginBottom: 18, borderRadius: 16, borderWidth: 1, borderColor: themeMode === "dark" ? "#6B5779" : "#BDD8CF", backgroundColor: themeMode === "dark" ? "#362B41" : "#DCEDE7" }}>
+      <Text style={{ color: themeMode === "dark" ? "#F4F5F2" : "#111111", fontSize: 14, fontWeight: "800" }}>Permission needed</Text>
+      <Text style={{ color: themeMode === "dark" ? "#D9CBDF" : "#496057", fontSize: 12, lineHeight: 18, marginTop: 4 }}>Give access to capture money alerts and receive recaps. Manual entry still works.</Text>
+      <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 8, marginTop: 10 }}>
+        {missingPermissions.map(({ label, action }) => (
+          <Pressable key={label} accessibilityRole="button" accessibilityLabel={label} onPress={action} style={{ minHeight: 44, paddingHorizontal: 13, paddingVertical: 10, justifyContent: "center", borderRadius: 11, backgroundColor: themeMode === "dark" ? "#CDB1E2" : "#111111" }}>
+            <Text style={{ color: themeMode === "dark" ? "#291D32" : "#FFFFFF", fontSize: 12, fontWeight: "700" }}>{label}</Text>
+          </Pressable>
+        ))}
+      </View>
+    </View>
+  ) : null;
+
+  const setupInk = themeMode === "dark" ? "#F8F4FA" : COLORS.ink;
+  const setupMuted = themeMode === "dark" ? "#C1B7C6" : COLORS.muted;
+  const setupSurface = themeMode === "dark" ? "#211D27" : COLORS.paper;
+  const setupLine = themeMode === "dark" ? "#494150" : COLORS.line;
+  const setupInput = themeMode === "dark" ? "#2D2833" : "#F7F5F1";
+  const setupBackdrop = themeMode === "dark" ? "#100E15" : COLORS.cream;
+  const purposeChoices: ProfilePurpose[] = ["Personal", "Business", "Both"];
+  const renderPurposeChoices = (selected: ProfilePurpose, onSelect: (purpose: ProfilePurpose) => void) => (
+    <View style={{ flexDirection: "row", gap: 8, marginTop: 9 }}>
+      {purposeChoices.map((purpose) => (
+        <Pressable key={purpose} accessibilityRole="button" onPress={() => onSelect(purpose)} style={{ flex: 1, minHeight: 46, borderRadius: 13, borderWidth: 1, borderColor: selected === purpose ? (themeMode === "dark" ? "#BA9CD0" : COLORS.green) : setupLine, backgroundColor: selected === purpose ? (themeMode === "dark" ? "#463453" : "#DCEDE7") : setupInput, alignItems: "center", justifyContent: "center" }}>
+          <Text style={{ color: setupInk, fontSize: 12, fontWeight: "800" }}>{purpose}</Text>
+        </Pressable>
+      ))}
+    </View>
+  );
+  const renderCurrencyChoices = (onSelect: (currency: string) => void) => (
+    <>
+      <TextInput value={currencySearch} onChangeText={setCurrencySearch} autoCapitalize="characters" placeholder="Search a currency, e.g. USD" placeholderTextColor={setupMuted} style={{ height: 52, borderRadius: 14, backgroundColor: setupInput, borderColor: setupLine, borderWidth: 1, paddingHorizontal: 15, color: setupInk, fontSize: 15, marginTop: 12 }} />
+      <ScrollView nestedScrollEnabled keyboardShouldPersistTaps="handled" style={{ maxHeight: 226, marginTop: 6 }}>
+        {visibleCurrencies.map((currency) => (
+          <Pressable key={currency} accessibilityRole="button" accessibilityLabel={`Choose ${currency}`} onPress={() => onSelect(currency)} style={{ flexDirection: "row", alignItems: "center", minHeight: 46, paddingHorizontal: 12, marginTop: 5, borderRadius: 12, borderWidth: 1, borderColor: currency === baseCurrency && currencyConfigured ? (themeMode === "dark" ? "#BA9CD0" : COLORS.green) : setupLine, backgroundColor: currency === baseCurrency && currencyConfigured ? (themeMode === "dark" ? "#463453" : "#DCEDE7") : setupSurface }}>
+            <Text style={{ flex: 1, color: setupInk, fontSize: 14, fontWeight: "700" }}>{currency}</Text>
+            {currency === baseCurrency && currencyConfigured && <Ionicons name="checkmark-circle" color={COLORS.green} size={20} />}
+          </Pressable>
+        ))}
+        {visibleCurrencies.length === 0 && <Text style={{ color: setupMuted, marginTop: 12 }}>No matching currency.</Text>}
+      </ScrollView>
+    </>
+  );
+  const renderAccessRow = (label: string, detail: string, enabled: boolean, action: () => void | Promise<void>) => (
+    <View style={{ flexDirection: "row", alignItems: "center", gap: 12, borderRadius: 16, borderWidth: 1, borderColor: setupLine, backgroundColor: setupSurface, padding: 13, marginTop: 10 }}>
+      <View style={{ flex: 1 }}>
+        <Text style={{ color: setupInk, fontSize: 14, fontWeight: "800" }}>{label}</Text>
+        <Text style={{ color: setupMuted, fontSize: 11, lineHeight: 16, marginTop: 3 }}>{detail}</Text>
+        <Text style={{ color: enabled ? COLORS.green : COLORS.gold, fontSize: 11, fontWeight: "800", marginTop: 6 }}>{enabled ? "Access on" : "Access off"}</Text>
+      </View>
+      <Pressable accessibilityRole="button" accessibilityLabel={`${enabled ? "Manage" : "Enable"} ${label}`} onPress={() => { Promise.resolve(action()).catch(() => setAccessFeedback("Couldn’t open permission settings.")); }} style={{ minWidth: 68, minHeight: 42, paddingHorizontal: 10, borderRadius: 11, justifyContent: "center", alignItems: "center", backgroundColor: enabled ? setupInput : COLORS.ink, borderWidth: enabled ? 1 : 0, borderColor: setupLine }}>
+        <Text style={{ color: enabled ? setupInk : "#FFFFFF", fontSize: 11, fontWeight: "800" }}>{enabled ? "Manage" : "Enable"}</Text>
+      </Pressable>
+    </View>
+  );
+  const accessRows = Platform.OS === "android" ? (
+    <>
+      {renderAccessRow("Financial SMS", "Detect eligible debit and credit SMS on this device.", smsEnabled, smsEnabled ? () => Linking.openSettings() : requestSetupSmsAccess)}
+      {renderAccessRow("Money alerts", "Read eligible banking, wallet, Messages and Gmail notifications.", notificationAccessEnabled, openAlertAccessSettings)}
+      {renderAccessRow("App notifications", "Allow MoneySync to deliver its own reminders and status alerts.", notificationsEnabled, notificationsEnabled ? () => Linking.openSettings() : requestSetupNotifications)}
+    </>
+  ) : null;
 
   return (
     <SafeAreaView style={[styles.safe, tab === "home" && styles.homeSafe]} edges={["top", "left", "right"]}>
@@ -981,7 +1636,9 @@ function KharchaApp() {
         style={styles.flex}
         {...tabSwipeResponder.panHandlers}
       >
+        <MotionView enterKey={tab} fromY={10} style={styles.flex}>
         <Animated.ScrollView
+          key={tab}
           ref={pageScrollRef}
           contentContainerStyle={[
             styles.scroll,
@@ -1002,20 +1659,36 @@ function KharchaApp() {
                 <Image source={require("./assets/icon.png")} style={styles.brandMark} />
                 <View>
                   <Text style={styles.logo}>MoneySync<Text style={styles.logoDot}>.</Text></Text>
-                  <Text style={styles.tagline}>PERSONAL FINANCE</Text>
+                  <Text style={styles.tagline}>{profilePurpose === "Business" ? "BUSINESS FINANCE" : profilePurpose === "Both" ? "PERSONAL + BUSINESS" : "PERSONAL FINANCE"}</Text>
                 </View>
               </View>
               <View style={styles.headerActions}>
                 <Pressable onPress={toggleTheme} style={styles.headerButton}><Ionicons name={themeMode === "dark" ? "sunny-outline" : "moon-outline"} size={19} color={themeMode === "dark" ? "#F4F5F2" : COLORS.ink} /></Pressable>
-                <Pressable onPress={requestDailyReports} style={styles.headerButton}><Ionicons name="notifications-outline" size={19} color={themeMode === "dark" ? "#F4F5F2" : COLORS.ink} /></Pressable>
-                <Pressable onPress={exportCsv} style={styles.headerButton}><Ionicons name="share-outline" size={20} color={themeMode === "dark" ? "#F4F5F2" : COLORS.ink} /></Pressable>
+                <Pressable onPress={toggleDailyReports} style={styles.headerButton}><Ionicons name="notifications-outline" size={19} color={themeMode === "dark" ? "#F4F5F2" : COLORS.ink} /></Pressable>
+                <Pressable accessibilityRole="button" accessibilityLabel="Open settings" onPress={openSettings} style={styles.headerButton}><Ionicons name="settings-outline" size={20} color={themeMode === "dark" ? "#F4F5F2" : COLORS.ink} /></Pressable>
               </View>
             </View>
           )}
 
+          {tab !== "home" && permissionBanner}
           {tab === "home" && (
             <>
               <View style={styles.homeSheet}>
+                {permissionBanner}
+                {invalidCurrencyCount > 0 && <Pressable style={styles.dateFilterCard} onPress={() => selectTab("activity")}>
+                  <Text style={styles.dateFilterTitle}>Review {invalidCurrencyCount} transaction {invalidCurrencyCount === 1 ? "currency" : "currencies"}</Text>
+                  <Text style={styles.subtitle}>Some older entries have unrecognized currency labels. Their amounts are preserved and excluded from totals until you edit the entry and select its currency.</Text>
+                </Pressable>}
+                {(ratesUnavailable || unconvertedCurrencies.length > 0) && <Pressable style={styles.dateFilterCard} onPress={() => updateRates(baseCurrency)}>
+                  <Text style={styles.dateFilterTitle}>Currency conversion needs attention</Text>
+                  <Text style={styles.subtitle}>{ratesUnavailable
+                    ? `Couldn’t refresh ${baseCurrency} rates. Tap to retry; cached rates are used when available.`
+                    : `${unconvertedCurrencies.join(", ")} ${unconvertedCurrencies.length === 1 ? "has" : "have"} no rate. Original amounts remain in descriptions; converted totals exclude them.`}</Text>
+                </Pressable>}
+                {duplicateReviews.length > 0 && <Pressable style={styles.dateFilterCard} onPress={() => selectTab("activity")}>
+                  <Text style={styles.dateFilterTitle}>{duplicateReviews.length} possible duplicate{duplicateReviews.length === 1 ? "" : "s"}</Text>
+                  <Text style={styles.subtitle}>Not included in totals · Tap to review</Text>
+                </Pressable>}
                 <View style={styles.quickHeader}>
                   <View style={styles.quickHeading}>
                     <Text style={styles.quickTitle}>Quick add</Text>
@@ -1023,21 +1696,21 @@ function KharchaApp() {
                   </View>
                   <View style={styles.todayMiniBadge}>
                     <Text style={styles.todayMiniLabel}>TODAY</Text>
-                    <Text style={styles.todayMiniValue}>{shortMoney(todayTotal)}</Text>
+                    <Text style={styles.todayMiniValue}>{shortMoney(todayTotal, baseCurrency)}</Text>
                   </View>
                 </View>
                 <View style={styles.typeToggle}>
                   <Pressable onPress={() => setEntryType("debit")} style={[styles.typeButton, entryType === "debit" && styles.typeButtonDebit]}>
-                    <Ionicons name="arrow-up-outline" size={13} color={entryType === "debit" ? "#FFF" : "#77736F"} />
+                    <Ionicons name="arrow-up-outline" size={17} color={entryType === "debit" ? (themeMode === "dark" ? "#241A2C" : "#FFF") : (themeMode === "dark" ? "#C3B9C8" : "#77736F")} />
                     <Text style={[styles.typeText, entryType === "debit" && styles.typeTextSelected]}>Expense</Text>
                   </Pressable>
                   <Pressable onPress={() => setEntryType("credit")} style={[styles.typeButton, entryType === "credit" && styles.typeButtonCredit]}>
-                    <Ionicons name="arrow-down-outline" size={13} color={entryType === "credit" ? "#0B0B0B" : "#77736F"} />
+                    <Ionicons name="arrow-down-outline" size={17} color={entryType === "credit" ? "#241A2C" : (themeMode === "dark" ? "#C3B9C8" : "#77736F")} />
                     <Text style={[styles.typeText, entryType === "credit" && styles.typeTextSelected, entryType === "credit" && styles.typeTextCreditSelected]}>Income</Text>
                   </Pressable>
                 </View>
                 <View style={styles.descriptionWrap}>
-                  <Ionicons name="create-outline" size={17} color="#706B67" />
+                  <Ionicons name="create-outline" size={19} color={themeMode === "dark" ? "#C8BDD0" : "#706B67"} />
                   <TextInput
                     ref={descriptionRef}
                     value={description}
@@ -1045,13 +1718,13 @@ function KharchaApp() {
                     onSubmitEditing={() => amountRef.current?.focus()}
                     returnKeyType="next"
                     placeholder="e.g. Lunch, fuel or rent"
-                    placeholderTextColor="#9A9590"
+                    placeholderTextColor={themeMode === "dark" ? "#AFA5B6" : "#9A9590"}
                     style={styles.descriptionInput}
                   />
                 </View>
                 <View style={styles.amountRow}>
                   <View style={styles.amountInputWrap}>
-                    <View style={styles.currencyBadge}><Text style={styles.currency}>Rs</Text></View>
+                    <View style={styles.currencyBadge}><Text style={styles.currency}>{baseCurrency}</Text></View>
                     <TextInput
                       ref={amountRef}
                       value={amount}
@@ -1060,7 +1733,7 @@ function KharchaApp() {
                       returnKeyType="done"
                       keyboardType="decimal-pad"
                       placeholder="0"
-                      placeholderTextColor="#9A9590"
+                      placeholderTextColor={themeMode === "dark" ? "#AFA5B6" : "#9A9590"}
                       style={styles.amountInput}
                     />
                   </View>
@@ -1083,9 +1756,11 @@ function KharchaApp() {
                     const meta = categoryMeta[item.name] ?? categoryMeta.Other;
                     return (
                       <View key={item.name} style={[styles.homeCategoryCard, index === 1 && styles.homeCategoryCardLilac, index === 2 && styles.homeCategoryCardMint]}>
-                        <View style={styles.homeCategoryIcon}><Ionicons name={meta.icon} size={17} color="#111" /></View>
+                        <View style={[styles.homeCategoryIcon, themeMode === "dark" && { backgroundColor: `${categoryAccent(item.name)}55` }]}>
+                          <Ionicons name={meta.icon} size={20} color={themeMode === "dark" ? "#FFFFFF" : "#111111"} />
+                        </View>
                         <Text numberOfLines={1} style={styles.homeCategoryName}>{item.name}</Text>
-                        <Text numberOfLines={1} style={styles.homeCategoryValue}>{shortMoney(item.value)}</Text>
+                        <Text numberOfLines={1} style={styles.homeCategoryValue}>{shortMoney(item.value, baseCurrency)}</Text>
                       </View>
                     );
                   })}
@@ -1094,21 +1769,23 @@ function KharchaApp() {
                 <View style={styles.homeSectionTop}>
                   <View>
                     <Text style={styles.homeSectionTitle}>Recent activity</Text>
-                    <Text style={styles.homeSectionCaption}>Tap an entry to edit it</Text>
+                    <Text style={styles.homeSectionCaption}>Tap an entry for full details</Text>
                   </View>
-                  <Pressable onPress={() => setTab("activity")}><Ionicons name="arrow-forward" size={18} color="#111" /></Pressable>
+                  <Pressable onPress={() => setTab("activity")}><Ionicons name="arrow-forward" size={18} color={themeMode === "dark" ? "#E8DAF3" : "#111"} /></Pressable>
                 </View>
                 <View style={styles.homeList}>
                   {expenses.slice(0, 5).map((item) => {
                     const meta = categoryMeta[item.category] ?? categoryMeta.Other;
+                    const display = transactionDisplay(item);
                     return (
-                      <Pressable key={item.id} onPress={() => openEditor(item)} onLongPress={() => removeEntry(item)} style={styles.homeTransaction}>
-                        <View style={[styles.homeTransactionIcon, { backgroundColor: `${meta.color}22` }]}><Ionicons name={meta.icon} color={meta.color} size={17} /></View>
+                      <Pressable key={item.id} onPress={() => setDetailExpense(item)} onLongPress={() => removeEntry(item)} style={styles.homeTransaction}>
+                        <View style={[styles.homeTransactionIcon, { backgroundColor: `${categoryAccent(item.category)}28` }]}><Ionicons name={meta.icon} color={categoryAccent(item.category)} size={18} /></View>
                         <View style={styles.transactionText}>
                           <Text numberOfLines={1} style={styles.homeTransactionTitle}>{item.description}</Text>
-                          <Text style={styles.homeTransactionMeta}>{item.category} · {new Date(item.createdAt).toLocaleDateString("en-PK", { day: "numeric", month: "short" })}</Text>
+                          {display.original ? <Text style={styles.homeTransactionOriginal}>{display.original}</Text> : null}
+                          <Text style={styles.homeTransactionMeta}>{item.category} · {entryDateTime(item.createdAt)}</Text>
                         </View>
-                        <Text style={[styles.homeTransactionAmount, item.type === "credit" && styles.homeCreditAmount]}>{item.type === "credit" ? "+" : "−"} {money(item.amount)}</Text>
+                        <Text style={[styles.homeTransactionAmount, item.type === "credit" && styles.homeCreditAmount]}>{item.type === "credit" ? "+" : "−"} {display.amount}</Text>
                       </Pressable>
                     );
                   })}
@@ -1121,10 +1798,32 @@ function KharchaApp() {
           {tab === "activity" && (
             <>
               <View style={styles.pageIntro}>
-                <Text style={styles.eyebrow}>EVERY RUPEE, REMEMBERED</Text>
+                <Text style={styles.eyebrow}>EVERY TRANSACTION, REMEMBERED</Text>
                 <Text style={styles.pageTitle}>Transactions</Text>
-                <Text style={styles.subtitle}>Tap to edit · Long-press to remove.</Text>
+                <Text style={styles.subtitle}>Tap for details · Long-press to remove.</Text>
               </View>
+              {duplicateReviews.length > 0 && <View style={styles.dateFilterCard}>
+                <Text style={styles.dateFilterTitle}>Possible duplicates</Text>
+                <Text style={styles.subtitle}>These alerts are not included in totals. Compare them before deciding.</Text>
+                {duplicateReviews.map((entry) => {
+                  const original = expenses.find((item) => item.id === entry.duplicateOf);
+                  const display = transactionDisplay(entry);
+                  const recordedDisplay = original ? transactionDisplay(original) : null;
+                  return <View key={entry.id} style={{ marginTop: 18, gap: 8 }}>
+                    <Text style={styles.dateFilterTitle}>{display.amount} · {entry.type === "credit" ? "Money in" : "Money out"}</Text>
+                    <Text style={styles.subtitle}>{entry.description}{display.original ? ` · ${display.original}` : ""}{"\n"}{entry.source === "sms" ? "SMS" : entry.source?.replace("notification:", "") || "Notification"} · {new Date(entry.createdAt).toLocaleString("en-PK")}</Text>
+                    <Text style={styles.subtitle}>Already recorded: {original ? `${original.description}${recordedDisplay?.original ? ` · ${recordedDisplay.original}` : ""} · ${recordedDisplay?.amount} · ${new Date(original.createdAt).toLocaleString("en-PK")}` : "Original entry no longer available"}</Text>
+                    <View style={{ flexDirection: "row", gap: 8 }}>
+                      <Pressable disabled={reviewSaving} style={styles.appDialogButton} onPress={() => showDialog("Same payment?", "Keep the recorded payment and dismiss this extra alert. It will not increase your totals.", [{ text: "Cancel", style: "cancel" }, { text: "Same payment", onPress: () => resolveDuplicate(entry, "same") }])}>
+                        <Text style={styles.appDialogButtonText}>Same payment</Text>
+                      </Pressable>
+                      <Pressable disabled={reviewSaving} style={[styles.appDialogButton, styles.appDialogButtonCancel]} onPress={() => resolveDuplicate(entry, "separate")}>
+                        <Text style={[styles.appDialogButtonText, styles.appDialogButtonTextCancel]}>Separate payment</Text>
+                      </Pressable>
+                    </View>
+                  </View>;
+                })}
+              </View>}
               <View style={styles.dateFilterCard}>
                 <View style={styles.dateFilterTop}>
                   <View>
@@ -1162,15 +1861,15 @@ function KharchaApp() {
                     }}
                     style={[styles.dateChip, styles.customDateChip, dateScope === "custom" && styles.dateChipActive]}
                   >
-                    <Ionicons name="calendar-outline" size={13} color={dateScope === "custom" ? "#FFF" : "#9B93A5"} />
+                    <Ionicons name="calendar-outline" size={13} color={dateScope === "custom" ? "#FFF" : (themeMode === "dark" ? "#C3B9C8" : "#9B93A5")} />
                     <Text style={[styles.dateChipText, dateScope === "custom" && styles.dateChipTextActive]}>Pick date</Text>
                   </Pressable>
                 </View>
               </View>
               <View style={styles.summaryStrip}>
-                <View><Text style={styles.summaryLabel}>MONEY IN</Text><Text style={[styles.summaryValue, { color: COLORS.green }]}>{shortMoney(filteredTotals.credits)}</Text></View>
+                <View><Text style={styles.summaryLabel}>MONEY IN</Text><Text style={[styles.summaryValue, { color: themeMode === "dark" ? "#80D5B5" : COLORS.green }]}>{shortMoney(filteredTotals.credits, baseCurrency)}</Text></View>
                 <View style={styles.summaryDivider} />
-                <View><Text style={styles.summaryLabel}>MONEY OUT</Text><Text style={[styles.summaryValue, { color: COLORS.coral }]}>{shortMoney(filteredTotals.debits)}</Text></View>
+                <View><Text style={styles.summaryLabel}>MONEY OUT</Text><Text style={[styles.summaryValue, { color: themeMode === "dark" ? "#F3998A" : COLORS.coral }]}>{shortMoney(filteredTotals.debits, baseCurrency)}</Text></View>
                 <View style={styles.summaryDivider} />
                 <View><Text style={styles.summaryLabel}>ENTRIES</Text><Text style={styles.summaryValue}>{filteredExpenses.length}</Text></View>
               </View>
@@ -1215,7 +1914,7 @@ function KharchaApp() {
                   <Ionicons name="analytics-outline" size={22} color="#CFC6FF" />
                 </View>
                 <Text style={styles.insightHeroLabel}>TOTAL MONEY OUT</Text>
-                <Text numberOfLines={1} adjustsFontSizeToFit style={styles.insightHeroAmount}>{money(totals.debits)}</Text>
+                <Text numberOfLines={1} adjustsFontSizeToFit style={styles.insightHeroAmount}>{money(totals.debits, baseCurrency)}</Text>
                 <Text style={styles.insightHeroStory}>
                   {categories[0]
                     ? `${categories[0].name} leads your spending at ${Math.round((categories[0].value / Math.max(totals.debits, 1)) * 100)}% this month.`
@@ -1225,12 +1924,12 @@ function KharchaApp() {
                 <View style={styles.insightHeroMetrics}>
                   <View style={styles.insightHeroMetric}>
                     <Text style={styles.insightHeroMetricLabel}>DAILY AVG</Text>
-                    <Text style={styles.insightHeroMetricValue}>{shortMoney(insightMetrics.average)}</Text>
+                    <Text style={styles.insightHeroMetricValue}>{shortMoney(insightMetrics.average, baseCurrency)}</Text>
                   </View>
                   <View style={styles.insightHeroMetricDivider} />
                   <View style={styles.insightHeroMetric}>
                     <Text style={styles.insightHeroMetricLabel}>TOP SPEND</Text>
-                    <Text style={styles.insightHeroMetricValue}>{shortMoney(insightMetrics.largest)}</Text>
+                    <Text style={styles.insightHeroMetricValue}>{shortMoney(insightMetrics.largest, baseCurrency)}</Text>
                   </View>
                   <View style={styles.insightHeroMetricDivider} />
                   <View style={styles.insightHeroMetric}>
@@ -1249,12 +1948,12 @@ function KharchaApp() {
                   <View style={styles.insightSectionIcon}><Ionicons name="pie-chart" size={17} color="#A997FF" /></View>
                 </View>
                 <View style={styles.chartRow}>
-                  <DonutChart categories={categories} total={totals.debits} />
+                  <DonutChart categories={categories} total={totals.debits} currency={baseCurrency} />
                   <View style={styles.legend}>
                     {categories.slice(0, 5).map((item) => (
                       <View key={item.name} style={styles.legendRow}>
-                        <View style={[styles.legendIcon, { backgroundColor: `${categoryMeta[item.name]?.color ?? categoryMeta.Other.color}20` }]}>
-                          <Ionicons name={categoryMeta[item.name]?.icon ?? categoryMeta.Other.icon} size={12} color={categoryMeta[item.name]?.color ?? categoryMeta.Other.color} />
+                        <View style={[styles.legendIcon, { backgroundColor: `${categoryAccent(item.name)}2F` }]}>
+                          <Ionicons name={categoryMeta[item.name]?.icon ?? categoryMeta.Other.icon} size={15} color={categoryAccent(item.name)} />
                         </View>
                         <Text style={styles.legendName}>{item.name}</Text>
                         <Text style={styles.legendValue}>{Math.round((item.value / Math.max(totals.debits, 1)) * 100)}%</Text>
@@ -1266,15 +1965,15 @@ function KharchaApp() {
                   <View key={item.name} style={styles.categoryBarRow}>
                     <View style={styles.categoryBarTop}>
                       <View style={styles.categoryBarIdentity}>
-                        <View style={[styles.categoryBarDot, { backgroundColor: categoryMeta[item.name]?.color ?? categoryMeta.Other.color }]} />
+                        <View style={[styles.categoryBarDot, { backgroundColor: categoryAccent(item.name) }]} />
                         <Text style={styles.categoryBarName}>{item.name}</Text>
                       </View>
                       <View style={styles.categoryBarNumbers}>
                         <Text style={styles.categoryBarPercent}>{Math.round((item.value / Math.max(totals.debits, 1)) * 100)}%</Text>
-                        <Text style={styles.categoryBarValue}>{money(item.value)}</Text>
+                        <Text style={styles.categoryBarValue}>{money(item.value, baseCurrency)}</Text>
                       </View>
                     </View>
-                    <View style={styles.barTrack}><View style={[styles.barFill, { width: `${Math.max(5, (item.value / Math.max(categories[0]?.value ?? 1, 1)) * 100)}%`, backgroundColor: categoryMeta[item.name]?.color ?? categoryMeta.Other.color }]} /></View>
+                    <View style={styles.barTrack}><View style={[styles.barFill, { width: `${Math.max(5, (item.value / Math.max(categories[0]?.value ?? 1, 1)) * 100)}%`, backgroundColor: categoryAccent(item.name) }]} /></View>
                   </View>
                 ))}
               </View>
@@ -1285,7 +1984,7 @@ function KharchaApp() {
                     <Text style={styles.eyebrow}>LAST 7 DAYS</Text>
                     <Text style={styles.chartTitle}>Daily spending pulse</Text>
                   </View>
-                  <View style={styles.chartTotalPill}><Text style={styles.chartTotalText}>{shortMoney(lastSevenDays.reduce((sum, item) => sum + item.value, 0))}</Text></View>
+                  <View style={styles.chartTotalPill}><Text style={styles.chartTotalText}>{shortMoney(lastSevenDays.reduce((sum, item) => sum + item.value, 0), baseCurrency)}</Text></View>
                 </View>
                 <View style={styles.weekChart}>
                   {lastSevenDays.map((item) => {
@@ -1293,7 +1992,7 @@ function KharchaApp() {
                     const height = item.value ? Math.max(8, (item.value / maximum) * 92) : 4;
                     return (
                       <View key={item.key} style={styles.weekColumn}>
-                        <Text numberOfLines={1} style={styles.weekValue}>{item.value ? shortMoney(item.value).replace("Rs ", "") : "—"}</Text>
+                        <Text numberOfLines={1} style={styles.weekValue}>{item.value ? shortMoney(item.value, baseCurrency).replace(`${baseCurrency === "PKR" ? "Rs" : baseCurrency} `, "") : "—"}</Text>
                         <View style={styles.weekBarSlot}>
                           <LinearGradient colors={item.value ? ["#B29DCE", "#846DA9"] : ["#E5E0DA", "#E5E0DA"]} style={[styles.weekBar, { height }]} />
                         </View>
@@ -1319,14 +2018,14 @@ function KharchaApp() {
                   const maximum = Math.max(totals.credits, totals.debits, 1);
                   return (
                     <View key={item.label} style={styles.flowRow}>
-                      <View style={styles.flowTop}><Text style={styles.flowLabel}>{item.label}</Text><Text style={styles.flowValue}>{money(item.value)}</Text></View>
+                      <View style={styles.flowTop}><Text style={styles.flowLabel}>{item.label}</Text><Text style={styles.flowValue}>{money(item.value, baseCurrency)}</Text></View>
                       <View style={styles.flowTrack}><View style={[styles.flowFill, { width: `${Math.max(item.value ? 4 : 0, (item.value / maximum) * 100)}%`, backgroundColor: item.color }]} /></View>
                     </View>
                   );
                 })}
                 <View style={styles.netFlow}>
                   <Text style={styles.netFlowLabel}>NET POSITION</Text>
-                  <Text style={[styles.netFlowValue, { color: totals.balance >= 0 ? COLORS.green : COLORS.coral }]}>{money(totals.balance)}</Text>
+                  <Text style={[styles.netFlowValue, { color: totals.balance >= 0 ? COLORS.green : COLORS.coral }]}>{money(totals.balance, baseCurrency)}</Text>
                 </View>
               </View>
 
@@ -1351,7 +2050,7 @@ function KharchaApp() {
                       <View key={item.label} style={styles.monthWeekColumn}>
                         <View style={styles.monthWeekSlot}><View style={[styles.monthWeekBar, { height }]} /></View>
                         <Text style={styles.weekLabel}>{item.label}</Text>
-                        <Text numberOfLines={1} style={styles.monthWeekValue}>{item.value ? shortMoney(item.value) : "Rs 0"}</Text>
+                        <Text numberOfLines={1} style={styles.monthWeekValue}>{item.value ? shortMoney(item.value, baseCurrency) : money(0, baseCurrency)}</Text>
                       </View>
                     );
                   })}
@@ -1362,12 +2061,12 @@ function KharchaApp() {
                 <View style={styles.metricCard}>
                   <View style={[styles.metricIcon, { backgroundColor: "#E8E2F2" }]}><Ionicons name="speedometer-outline" size={18} color={COLORS.purple} /></View>
                   <Text style={styles.metricLabel}>DAILY AVERAGE</Text>
-                  <Text style={styles.metricValue}>{shortMoney(insightMetrics.average)}</Text>
+                  <Text style={styles.metricValue}>{shortMoney(insightMetrics.average, baseCurrency)}</Text>
                 </View>
                 <View style={styles.metricCard}>
                   <View style={[styles.metricIcon, { backgroundColor: "#F3E2DE" }]}><Ionicons name="flash-outline" size={18} color={COLORS.coral} /></View>
                   <Text style={styles.metricLabel}>LARGEST SPEND</Text>
-                  <Text style={styles.metricValue}>{shortMoney(insightMetrics.largest)}</Text>
+                  <Text style={styles.metricValue}>{shortMoney(insightMetrics.largest, baseCurrency)}</Text>
                 </View>
                 <View style={styles.metricCard}>
                   <View style={[styles.metricIcon, { backgroundColor: "#DCEDE7" }]}><Ionicons name="calendar-outline" size={18} color={COLORS.green} /></View>
@@ -1382,23 +2081,35 @@ function KharchaApp() {
               </View>
 
               <View style={styles.monthCards}>
-                <View style={[styles.monthCard, { backgroundColor: "#DCEDE7" }]}>
+                <View style={[styles.monthCard, { backgroundColor: themeMode === "dark" ? "#20352D" : "#DCEDE7" }]}>
                   <Ionicons name="arrow-down-circle-outline" size={23} color={COLORS.green} />
                   <Text style={styles.monthCardLabel}>TOTAL CREDIT</Text>
-                  <Text style={styles.monthCardValue}>{money(totals.credits)}</Text>
+                  <Text style={styles.monthCardValue}>{money(totals.credits, baseCurrency)}</Text>
                 </View>
-                <View style={[styles.monthCard, { backgroundColor: "#F3E2DE" }]}>
+                <View style={[styles.monthCard, { backgroundColor: themeMode === "dark" ? "#3A2926" : "#F3E2DE" }]}>
                   <Ionicons name="arrow-up-circle-outline" size={23} color={COLORS.coral} />
                   <Text style={styles.monthCardLabel}>TOTAL DEBIT</Text>
-                  <Text style={styles.monthCardValue}>{money(totals.debits)}</Text>
+                  <Text style={styles.monthCardValue}>{money(totals.debits, baseCurrency)}</Text>
                 </View>
               </View>
 
-              <Pressable onPress={requestDailyReports} style={styles.notificationCard}>
-                <View style={styles.notificationIcon}><Ionicons name="notifications-outline" size={21} color={COLORS.purple} /></View>
-                <View style={styles.flex}><Text style={styles.notificationTitle}>Evening money recap</Text><Text style={styles.notificationCopy}>{notificationsEnabled ? "On · Daily reminder scheduled for 8:30 PM." : "Off · Tap to allow MoneySync notifications."}</Text></View>
-                <Ionicons name={notificationsEnabled ? "checkmark-circle" : "chevron-forward"} size={20} color={notificationsEnabled ? COLORS.green : "#AAA5AD"} />
+              <Pressable onPress={() => setCurrencyPickerVisible(true)} style={styles.notificationCard}>
+                <View style={[styles.notificationIcon, { backgroundColor: "#DCEDE7" }]}><Ionicons name="cash-outline" size={21} color={COLORS.green} /></View>
+                <View style={styles.flex}>
+                  <Text style={styles.notificationTitle}>Base currency · {baseCurrency}</Text>
+                  <Text style={styles.notificationCopy}>{ratesUpdatedAt
+                    ? `Converted with a cached daily rate · ${new Date(ratesUpdatedAt).toLocaleDateString("en-PK")}`
+                    : "Choose the currency used for totals and manual entries."}</Text>
+                  <Text onPress={(event) => { event.stopPropagation(); Linking.openURL("https://www.exchangerate-api.com"); }} style={[styles.notificationCopy, { color: COLORS.green, marginTop: 3 }]}>Rates by Exchange Rate API</Text>
+                </View>
+                <Ionicons name="chevron-forward" size={20} color="#77717E" />
               </Pressable>
+
+              <View style={styles.notificationCard}>
+                <View style={styles.notificationIcon}><Ionicons name="notifications-outline" size={21} color={COLORS.purple} /></View>
+                <View style={styles.flex}><Text style={styles.notificationTitle}>Evening money recap</Text><Text style={styles.notificationCopy}>{dailyRecapEnabled ? "On · Daily reminder scheduled for 8:30 PM." : "Off · Turn on for a daily reminder at 8:30 PM."}</Text></View>
+                <Switch accessibilityLabel="Evening money recap" value={dailyRecapEnabled} disabled={recapChanging} onValueChange={toggleDailyReports} trackColor={{ false: "#817C77", true: "#4E9C82" }} thumbColor="#FCFBF8" />
+              </View>
 
               <Pressable onPress={requestGmailAccess} style={styles.notificationCard}>
                 <View style={[styles.notificationIcon, { backgroundColor: "#DCEDE7" }]}><Ionicons name="chatbox-ellipses-outline" size={21} color={COLORS.green} /></View>
@@ -1420,6 +2131,7 @@ function KharchaApp() {
             </>
           )}
         </Animated.ScrollView>
+        </MotionView>
       </KeyboardAvoidingView>
 
       {tab === "home" && (
@@ -1428,7 +2140,7 @@ function KharchaApp() {
           style={[
             baseStyles.homeTopShell,
             themeMode === "dark"
-              ? { backgroundColor: "#202622", borderColor: "#3A453E", shadowOpacity: .42 }
+              ? { backgroundColor: "#28232E", borderColor: "#4B4153", shadowOpacity: .42 }
               : { backgroundColor: "#090909", borderColor: "#090909", shadowOpacity: .18 },
             {
               top: insets.top + 8,
@@ -1438,7 +2150,7 @@ function KharchaApp() {
           ]}
         >
           <View style={[baseStyles.homeOrbitLarge, themeMode === "dark" && { borderColor: "#B8A7D52E" }]} />
-          <View style={[baseStyles.homeOrbitSmall, themeMode === "dark" && { borderColor: "#9ED8C63D" }]} />
+          <View style={[baseStyles.homeOrbitSmall, themeMode === "dark" && { borderColor: "#D5B5E34D" }]} />
 
           <Animated.View style={[baseStyles.homeHeader, { opacity: expandedHeaderOpacity }]}>
             <View style={baseStyles.homeBrand}>
@@ -1447,8 +2159,8 @@ function KharchaApp() {
             </View>
             <View style={baseStyles.homeHeaderActions}>
               <Pressable onPress={toggleTheme} style={[baseStyles.homeRoundButton, themeMode === "dark" && { backgroundColor: "#FFFFFF0D", borderColor: "#FFFFFF24" }]}><Ionicons name={themeMode === "dark" ? "sunny-outline" : "moon-outline"} size={17} color="#F8F7F3" /></Pressable>
-              <Pressable onPress={requestDailyReports} style={[baseStyles.homeRoundButton, themeMode === "dark" && { backgroundColor: "#FFFFFF0D", borderColor: "#FFFFFF24" }]}><Ionicons name="notifications-outline" size={17} color="#F8F7F3" /></Pressable>
-              <Pressable onPress={exportCsv} style={[baseStyles.homeRoundButton, themeMode === "dark" && { backgroundColor: "#FFFFFF0D", borderColor: "#FFFFFF24" }]}><Ionicons name="share-outline" size={17} color="#F8F7F3" /></Pressable>
+              <Pressable onPress={toggleDailyReports} style={[baseStyles.homeRoundButton, themeMode === "dark" && { backgroundColor: "#FFFFFF0D", borderColor: "#FFFFFF24" }]}><Ionicons name="notifications-outline" size={17} color="#F8F7F3" /></Pressable>
+              <Pressable accessibilityRole="button" accessibilityLabel="Open settings" onPress={openSettings} style={[baseStyles.homeRoundButton, themeMode === "dark" && { backgroundColor: "#FFFFFF0D", borderColor: "#FFFFFF24" }]}><Ionicons name="settings-outline" size={17} color="#F8F7F3" /></Pressable>
             </View>
           </Animated.View>
 
@@ -1466,30 +2178,149 @@ function KharchaApp() {
               <Animated.Text style={[baseStyles.heroBalanceLabel, baseStyles.homeExpandedBalanceLabel, { opacity: expandedHeaderOpacity }]}>Your net position</Animated.Text>
               <Animated.Text style={[baseStyles.compactBalanceLabel, baseStyles.homeCollapsedBalanceLabel, { opacity: collapsedHeaderOpacity }]}>{overviewLabel} BALANCE</Animated.Text>
             </View>
-            <Text numberOfLines={1} adjustsFontSizeToFit style={baseStyles.heroBalance}>{money(overviewTotals.balance)}</Text>
+            <Text numberOfLines={1} adjustsFontSizeToFit style={baseStyles.heroBalance}>{money(overviewTotals.balance, baseCurrency)}</Text>
             <Animated.Text style={[baseStyles.heroBalanceCaption, { opacity: expandedHeaderOpacity }]}>Updated from {overviewExpenses.length} transaction{overviewExpenses.length === 1 ? "" : "s"}</Animated.Text>
           </Animated.View>
 
           <Animated.View style={[baseStyles.heroStats, baseStyles.homeHeroStats, themeMode === "dark" && { backgroundColor: "#0B0E0C66", borderWidth: 1, borderColor: "#FFFFFF12" }, { opacity: expandedHeaderOpacity }]}>
             <View style={baseStyles.heroStat}>
               <Text style={baseStyles.heroStatLabel}>MONEY IN</Text>
-              <Text style={baseStyles.heroStatValue}>{shortMoney(overviewTotals.credits)}</Text>
+              <Text style={baseStyles.heroStatValue}>{shortMoney(overviewTotals.credits, baseCurrency)}</Text>
             </View>
             <View style={baseStyles.heroStatDivider} />
             <View style={baseStyles.heroStat}>
               <Text style={baseStyles.heroStatLabel}>MONEY OUT</Text>
-              <Text style={baseStyles.heroStatValue}>{shortMoney(overviewTotals.debits)}</Text>
+              <Text style={baseStyles.heroStatValue}>{shortMoney(overviewTotals.debits, baseCurrency)}</Text>
             </View>
           </Animated.View>
 
-          <Animated.View pointerEvents="none" style={[baseStyles.compactBalanceMark, themeMode === "dark" && { backgroundColor: "#A9D9CA" }, { opacity: collapsedHeaderOpacity }]}>
-            <Ionicons name="wallet-outline" size={18} color="#0B0B0B" />
+          <Animated.View pointerEvents="box-none" style={[baseStyles.compactBalanceMark, themeMode === "dark" && { backgroundColor: "#A9D9CA" }, { opacity: collapsedHeaderOpacity }]}>
+            <Pressable accessibilityRole="button" accessibilityLabel="Open settings" onPress={openSettings} style={{ width: 38, height: 38, alignItems: "center", justifyContent: "center" }}>
+              <Ionicons name="settings-outline" size={18} color="#0B0B0B" />
+            </Pressable>
           </Animated.View>
         </Animated.View>
       )}
 
+      <Modal visible={onboardingVisible} animationType={reducedMotion ? "none" : "slide"} onRequestClose={() => undefined}>
+        <SafeAreaView edges={["top", "bottom"]} style={{ flex: 1, backgroundColor: setupBackdrop }}>
+          <StatusBar style={themeMode === "dark" ? "light" : "dark"} />
+          <ScrollView keyboardShouldPersistTaps="handled" contentContainerStyle={{ paddingHorizontal: 22, paddingTop: 22, paddingBottom: 25 }}>
+            <View style={{ minHeight: 168, borderRadius: 26, backgroundColor: themeMode === "dark" ? "#28232E" : "#0B0D0C", padding: 22, justifyContent: "space-between", overflow: "hidden" }}>
+              <View style={{ flexDirection: "row", alignItems: "center", gap: 11 }}>
+                <Image source={require("./assets/icon.png")} style={{ width: 38, height: 38, borderRadius: 11 }} />
+                <Text style={{ color: "#FFFFFF", fontSize: 23, fontWeight: "900", letterSpacing: -.8 }}>MoneySync.</Text>
+              </View>
+              <View>
+                <Text style={{ color: "#BFE1DA", fontSize: 11, fontWeight: "900", letterSpacing: 1.5 }}>YOUR MONEY, YOUR WAY</Text>
+                <Text style={{ color: "#FFFFFF", fontSize: 24, fontWeight: "900", marginTop: 5 }}>{onboardingStep === 0 ? "Welcome to your wallet" : onboardingStep === 1 ? "Make it yours" : onboardingStep === 2 ? "Set your starting point" : "Stay in the loop"}</Text>
+              </View>
+            </View>
+            <View style={{ flexDirection: "row", gap: 7, marginTop: 20, marginBottom: 20 }}>
+              {[0, 1, 2, 3].map((step) => <View key={step} style={{ height: 4, flex: 1, borderRadius: 3, backgroundColor: step <= onboardingStep ? (themeMode === "dark" ? "#C5A6DC" : COLORS.green) : setupLine }} />)}
+            </View>
+
+            {onboardingStep === 0 && <View>
+              <Text style={{ color: setupInk, fontSize: 20, fontWeight: "900" }}>A little about you</Text>
+              <Text style={{ color: setupMuted, fontSize: 13, lineHeight: 20, marginTop: 6 }}>Your profile stays on this device. Existing transactions remain in your wallet through this update.</Text>
+              <Text style={{ color: setupInk, fontSize: 12, fontWeight: "800", marginTop: 24 }}>YOUR NAME</Text>
+              <TextInput accessibilityLabel="Your name" value={profileName} onChangeText={(value) => { setProfileName(value); setOnboardingError(""); }} maxLength={60} autoCapitalize="words" placeholder="What should we call you?" placeholderTextColor={setupMuted} style={{ height: 54, borderRadius: 14, borderWidth: 1, borderColor: setupLine, backgroundColor: setupInput, color: setupInk, paddingHorizontal: 15, fontSize: 15, marginTop: 9 }} />
+              <Text style={{ color: setupInk, fontSize: 12, fontWeight: "800", marginTop: 22 }}>PROFILE TYPE</Text>
+              {renderPurposeChoices(profilePurpose, setProfilePurpose)}
+              <Text style={{ color: setupMuted, fontSize: 11, lineHeight: 17, marginTop: 10 }}>This labels your profile; transactions stay in one wallet.</Text>
+            </View>}
+
+            {onboardingStep === 1 && <View>
+              <Text style={{ color: setupInk, fontSize: 20, fontWeight: "900" }}>Currency & appearance</Text>
+              <Text style={{ color: setupMuted, fontSize: 13, lineHeight: 20, marginTop: 6 }}>Choose the currency for totals and new manual entries. Imported alerts retain their original currency.</Text>
+              <Text style={{ color: setupInk, fontSize: 12, fontWeight: "800", marginTop: 22 }}>BASE CURRENCY {currencyConfigured ? `· ${baseCurrency}` : "· REQUIRED"}</Text>
+              {renderCurrencyChoices((currency) => { chooseBaseCurrency(currency).catch(() => setOnboardingError("Couldn’t save currency. Please try again.")); setOnboardingError(""); })}
+              <Text style={{ color: setupInk, fontSize: 12, fontWeight: "800", marginTop: 22 }}>THEME</Text>
+              <View style={{ flexDirection: "row", gap: 8, marginTop: 9 }}>
+                {(["system", "light", "dark"] as ThemePreference[]).map((mode) => <Pressable key={mode} accessibilityRole="button" onPress={() => { selectThemePreference(mode).catch(() => setOnboardingError("Couldn’t save theme.")); }} style={{ flex: 1, minHeight: 50, flexDirection: "row", gap: 5, alignItems: "center", justifyContent: "center", borderRadius: 14, borderWidth: 1, borderColor: themePreference === mode ? (themeMode === "dark" ? "#BA9CD0" : COLORS.green) : setupLine, backgroundColor: setupSurface }}><Ionicons name={mode === "dark" ? "moon-outline" : mode === "system" ? "phone-portrait-outline" : "sunny-outline"} size={17} color={setupInk} /><Text style={{ color: setupInk, fontWeight: "800", fontSize: 12 }}>{mode === "system" ? "System" : mode === "dark" ? "Dark" : "Light"}</Text></Pressable>)}
+              </View>
+              <Text style={{ color: setupMuted, fontSize: 11, lineHeight: 17, marginTop: 17 }}>Exchange rates are cached daily. Only currency codes go to the rate provider.</Text>
+            </View>}
+
+            {onboardingStep === 2 && <View>
+              <Text style={{ color: setupInk, fontSize: 20, fontWeight: "900" }}>Start with your current balance</Text>
+              <Text style={{ color: setupMuted, fontSize: 13, lineHeight: 20, marginTop: 6 }}>Optional: tell MoneySync how much you currently have so your net balance starts from the right place. You can skip this and add it later as a normal transaction.</Text>
+              <Text style={{ color: setupInk, fontSize: 12, fontWeight: "800", marginTop: 24 }}>STARTING BALANCE · {baseCurrency}</Text>
+              <TextInput accessibilityLabel="Optional starting balance" value={openingBalance} onChangeText={(value) => { setOpeningBalance(value.replace(/[^0-9.,]/g, "")); setOnboardingError(""); }} keyboardType="decimal-pad" inputMode="decimal" placeholder="e.g. 50000" placeholderTextColor={setupMuted} style={{ height: 58, borderRadius: 14, borderWidth: 1, borderColor: setupLine, backgroundColor: setupInput, color: setupInk, paddingHorizontal: 15, fontSize: 21, fontWeight: "800", marginTop: 9 }} />
+              <Text style={{ color: setupMuted, fontSize: 11, lineHeight: 17, marginTop: 10 }}>This is stored only on your device. Leave it blank if you prefer not to share it.</Text>
+            </View>}
+
+            {onboardingStep === 3 && <View>
+              <Text style={{ color: setupInk, fontSize: 20, fontWeight: "900" }}>Choose your access</Text>
+              <Text style={{ color: setupMuted, fontSize: 13, lineHeight: 20, marginTop: 6 }}>Allow the alerts you want MoneySync to capture. Android will show its own permission screen for each one. Manual entry works without them.</Text>
+              {accessRows}
+              {accessFeedback ? <Text style={{ color: COLORS.gold, fontSize: 12, lineHeight: 18, marginTop: 14 }}>{accessFeedback}</Text> : null}
+              <Text style={{ color: setupMuted, fontSize: 11, lineHeight: 18, marginTop: 18 }}>Financial messages are processed locally. OTPs and unrelated notifications are ignored; full message text is not saved or sent to the rate provider.</Text>
+            </View>}
+            {onboardingError ? <Text accessibilityRole="alert" style={{ color: COLORS.coral, fontSize: 12, fontWeight: "700", marginTop: 18 }}>{onboardingError}</Text> : null}
+          </ScrollView>
+          <View style={{ flexDirection: "row", gap: 10, paddingHorizontal: 22, paddingTop: 12, paddingBottom: 12, borderTopWidth: 1, borderColor: setupLine }}>
+            {onboardingStep > 0 && <Pressable accessibilityRole="button" onPress={() => { setOnboardingStep(onboardingStep - 1); setOnboardingError(""); }} style={{ minHeight: 52, minWidth: 95, borderRadius: 14, borderWidth: 1, borderColor: setupLine, alignItems: "center", justifyContent: "center" }}><Text style={{ color: setupInk, fontWeight: "800" }}>Back</Text></Pressable>}
+            <Pressable accessibilityRole="button" disabled={onboardingSaving} onPress={() => {
+              if (onboardingStep === 0 && !profileName.trim()) { setOnboardingError("Enter your name to continue."); return; }
+              if (onboardingStep === 1 && !currencyConfigured) { setOnboardingError("Choose your base currency to continue."); return; }
+              if (onboardingStep < 3) { Keyboard.dismiss(); setOnboardingError(""); setOnboardingStep(onboardingStep + 1); return; }
+              finishOnboarding();
+            }} style={{ flex: 1, minHeight: 52, borderRadius: 14, backgroundColor: themeMode === "dark" ? "#765591" : COLORS.ink, alignItems: "center", justifyContent: "center" }}><Text style={{ color: "#FFFFFF", fontSize: 14, fontWeight: "900" }}>{onboardingStep === 3 ? (onboardingSaving ? "Saving…" : "Finish setup") : "Continue"}</Text></Pressable>
+          </View>
+        </SafeAreaView>
+      </Modal>
+
+      <Modal visible={settingsVisible} animationType={reducedMotion ? "none" : "slide"} onRequestClose={() => setSettingsVisible(false)}>
+        <SafeAreaView edges={["top", "bottom"]} style={{ flex: 1, backgroundColor: setupBackdrop }}>
+          <StatusBar style={themeMode === "dark" ? "light" : "dark"} />
+          <View style={{ flexDirection: "row", alignItems: "center", paddingHorizontal: 20, paddingTop: 14, paddingBottom: 14, borderBottomWidth: 1, borderColor: setupLine }}>
+            <View style={{ flex: 1 }}><Text style={{ color: setupMuted, fontSize: 10, fontWeight: "900", letterSpacing: 1.4 }}>MONEYSYNC</Text><Text style={{ color: setupInk, fontSize: 25, fontWeight: "900" }}>Settings</Text></View>
+            <Pressable accessibilityRole="button" accessibilityLabel="Close settings" onPress={() => setSettingsVisible(false)} style={{ width: 42, height: 42, borderRadius: 13, backgroundColor: setupSurface, borderWidth: 1, borderColor: setupLine, alignItems: "center", justifyContent: "center" }}><Ionicons name="close" size={22} color={setupInk} /></Pressable>
+          </View>
+          <ScrollView keyboardShouldPersistTaps="handled" contentContainerStyle={{ paddingHorizontal: 20, paddingVertical: 18, paddingBottom: 36 }}>
+            <Text style={{ color: setupInk, fontSize: 17, fontWeight: "900" }}>Your profile</Text>
+            <Text style={{ color: setupMuted, fontSize: 12, marginTop: 4 }}>Saved locally on this device.</Text>
+            <TextInput accessibilityLabel="Your name" value={settingsNameDraft} onChangeText={(value) => { setSettingsNameDraft(value); setProfileFeedback(""); }} maxLength={60} autoCapitalize="words" placeholder="Your name" placeholderTextColor={setupMuted} style={{ height: 52, borderRadius: 14, borderWidth: 1, borderColor: setupLine, backgroundColor: setupInput, color: setupInk, paddingHorizontal: 15, fontSize: 15, marginTop: 14 }} />
+            {renderPurposeChoices(settingsPurposeDraft, (purpose) => { setSettingsPurposeDraft(purpose); setProfileFeedback(""); })}
+            <Text style={{ color: setupMuted, fontSize: 11, marginTop: 9 }}>Profile type does not separate transactions.</Text>
+            <Pressable accessibilityRole="button" disabled={profileSaving} onPress={saveSettingsProfile} style={{ minHeight: 46, borderRadius: 13, backgroundColor: themeMode === "dark" ? "#765591" : COLORS.ink, alignItems: "center", justifyContent: "center", marginTop: 11 }}><Text style={{ color: "#FFFFFF", fontWeight: "900" }}>{profileSaving ? "Saving…" : "Save profile"}</Text></Pressable>
+            {profileFeedback ? <Text accessibilityRole="alert" style={{ color: profileFeedback.startsWith("Profile saved") ? COLORS.green : COLORS.coral, marginTop: 9, fontSize: 12 }}>{profileFeedback}</Text> : null}
+
+            <Text style={{ color: setupInk, fontSize: 17, fontWeight: "900", marginTop: 30 }}>Preferences</Text>
+            {Platform.OS === "android" && <Pressable accessibilityRole="button" disabled={playUpdateBusy} onPress={() => {
+              if (playUpdateState?.installStatus === "DOWNLOADED") completePlayUpdate();
+              else checkForPlayUpdate(true).catch(() => undefined);
+            }} style={{ flexDirection: "row", alignItems: "center", minHeight: 64, borderRadius: 16, borderWidth: 1, borderColor: setupLine, backgroundColor: setupSurface, paddingHorizontal: 15, marginTop: 12, opacity: playUpdateBusy ? 0.65 : 1 }}>
+              <Ionicons name={playUpdateState?.installStatus === "DOWNLOADED" ? "download-outline" : "refresh-outline"} size={20} color={setupInk} />
+              <View style={{ flex: 1, marginLeft: 12 }}>
+                <Text style={{ color: setupInk, fontSize: 14, fontWeight: "800" }}>{playUpdateState?.installStatus === "DOWNLOADED" ? "Install MoneySync update" : "Check for app updates"}</Text>
+                <Text style={{ color: setupMuted, fontSize: 11, marginTop: 4 }}>
+                  {playUpdateState?.installStatus === "DOWNLOADING" && playUpdateState.totalBytesToDownload > 0
+                    ? `Downloading · ${Math.round(playUpdateState.bytesDownloaded / playUpdateState.totalBytesToDownload * 100)}%`
+                : playUpdateInfo?.available ? "An update is available on Google Play" : "Checks Google Play for a newer version"}
+                </Text>
+              </View>
+              {playUpdateBusy ? <Text style={{ color: setupMuted, fontSize: 11 }}>Checking…</Text> : <Ionicons name="chevron-forward" size={18} color={setupMuted} />}
+            </Pressable>}
+            <Pressable accessibilityRole="button" onPress={() => { setSettingsCurrencyOpen(!settingsCurrencyOpen); setCurrencySearch(""); }} style={{ flexDirection: "row", alignItems: "center", minHeight: 64, borderRadius: 16, borderWidth: 1, borderColor: setupLine, backgroundColor: setupSurface, paddingHorizontal: 15, marginTop: 12 }}><View style={{ flex: 1 }}><Text style={{ color: setupInk, fontSize: 14, fontWeight: "800" }}>Base currency · {baseCurrency}</Text><Text style={{ color: setupMuted, fontSize: 11, marginTop: 4 }}>{ratesUpdatedAt ? `Rates cached ${new Date(ratesUpdatedAt).toLocaleDateString()}` : "Used for totals and manual entries"}</Text></View><Ionicons name={settingsCurrencyOpen ? "chevron-up" : "chevron-down"} size={18} color={setupInk} /></Pressable>
+            {settingsCurrencyOpen && renderCurrencyChoices((currency) => { chooseBaseCurrency(currency).catch(() => setProfileFeedback("Couldn’t save currency.")); setSettingsCurrencyOpen(false); })}
+            <Text style={{ color: setupInk, fontSize: 14, fontWeight: "800", marginTop: 18 }}>Appearance</Text>
+            <View style={{ flexDirection: "row", gap: 8, marginTop: 9 }}>
+              {(["system", "light", "dark"] as ThemePreference[]).map((mode) => <Pressable key={mode} accessibilityRole="button" accessibilityLabel={`${mode === "system" ? "Use system theme" : `Use ${mode} theme`}`} onPress={() => { selectThemePreference(mode).catch(() => setProfileFeedback("Couldn’t save theme.")); }} style={{ flex: 1, minHeight: 46, flexDirection: "row", gap: 5, alignItems: "center", justifyContent: "center", borderRadius: 13, borderWidth: 1, borderColor: themePreference === mode ? (themeMode === "dark" ? "#BA9CD0" : COLORS.green) : setupLine, backgroundColor: setupSurface }}><Ionicons name={mode === "dark" ? "moon-outline" : mode === "system" ? "phone-portrait-outline" : "sunny-outline"} size={16} color={setupInk} /><Text style={{ color: setupInk, fontSize: 12, fontWeight: "800" }}>{mode === "system" ? "System" : mode === "dark" ? "Dark" : "Light"}</Text></Pressable>)}
+            </View>
+            <View style={{ flexDirection: "row", alignItems: "center", minHeight: 64, borderRadius: 16, borderWidth: 1, borderColor: setupLine, backgroundColor: setupSurface, paddingHorizontal: 15, marginTop: 10 }}><View style={{ flex: 1 }}><Text style={{ color: setupInk, fontSize: 14, fontWeight: "800" }}>Evening money recap</Text><Text style={{ color: setupMuted, fontSize: 11, marginTop: 4 }}>{dailyRecapEnabled ? "On · 8:30 PM" : "Off"}</Text></View><Switch accessibilityLabel="Evening money recap" value={dailyRecapEnabled} disabled={recapChanging} onValueChange={toggleDailyReports} trackColor={{ false: themeMode === "dark" ? "#625968" : "#817C77", true: themeMode === "dark" ? "#9E7FBA" : "#4E9C82" }} thumbColor="#FCFBF8" /></View>
+
+            {Platform.OS === "android" && <><Text style={{ color: setupInk, fontSize: 17, fontWeight: "900", marginTop: 30 }}>Access</Text><Text style={{ color: setupMuted, fontSize: 12, lineHeight: 18, marginTop: 4 }}>Choose which automatic capture features MoneySync can use.</Text>{accessRows}{accessFeedback ? <Text style={{ color: COLORS.gold, fontSize: 12, marginTop: 10 }}>{accessFeedback}</Text> : null}</>}
+            <Text style={{ color: setupInk, fontSize: 17, fontWeight: "900", marginTop: 30 }}>Your data</Text>
+            <Pressable accessibilityRole="button" onPress={exportCsv} style={{ flexDirection: "row", alignItems: "center", minHeight: 58, borderRadius: 16, borderWidth: 1, borderColor: setupLine, backgroundColor: setupSurface, paddingHorizontal: 15, marginTop: 12 }}><Ionicons name="share-outline" size={20} color={setupInk} /><Text style={{ flex: 1, color: setupInk, fontSize: 14, fontWeight: "800", marginLeft: 12 }}>Export transactions as CSV</Text><Ionicons name="chevron-forward" size={18} color={setupMuted} /></Pressable>
+            <Text onPress={() => Linking.openURL("https://www.exchangerate-api.com")} style={{ color: COLORS.green, fontSize: 11, marginTop: 22 }}>Rates by Exchange Rate API</Text>
+          </ScrollView>
+        </SafeAreaView>
+      </Modal>
+
       <Modal
-        animationType="fade"
+        animationType={reducedMotion ? "none" : "fade"}
         transparent
         visible={Boolean(appDialog)}
         onRequestClose={() => setAppDialog(null)}
@@ -1499,7 +2330,7 @@ function KharchaApp() {
           {appDialog && (() => {
             const tone = DIALOG_TONES[appDialog.tone];
             return (
-              <View style={styles.appDialogCard}>
+              <MotionView enterKey={appDialog} fromY={14} style={styles.appDialogCard}>
                 <View style={[styles.appDialogIcon, { backgroundColor: tone.background }]}>
                   <Ionicons name={tone.icon} size={24} color={tone.color} />
                 </View>
@@ -1540,21 +2371,64 @@ function KharchaApp() {
                     );
                   })}
                 </View>
-              </View>
+              </MotionView>
             );
           })()}
         </View>
       </Modal>
 
       <Modal
-        animationType="fade"
+        animationType={reducedMotion ? "none" : "fade"}
+        transparent
+        visible={currencyPickerVisible}
+        onRequestClose={() => { if (currencyConfigured) setCurrencyPickerVisible(false); }}
+      >
+        <KeyboardAvoidingView behavior={Platform.OS === "ios" ? "padding" : undefined} style={styles.editorBackdrop}>
+          {currencyConfigured && <Pressable style={StyleSheet.absoluteFill} onPress={() => setCurrencyPickerVisible(false)} />}
+          <MotionView enterKey={currencyPickerVisible} fromY={18} style={[styles.editorCard, { maxHeight: "78%" }]}>
+            <View style={styles.editorHeader}>
+              <View style={styles.flex}>
+                <Text style={styles.editorEyebrow}>{currencyConfigured ? "DISPLAY SETTINGS" : "WELCOME TO MONEYSYNC"}</Text>
+                <Text style={styles.editorTitle}>Choose your base currency</Text>
+                <Text style={[styles.notificationCopy, { marginTop: 6 }]}>Totals and manual entries use this currency. Imported alerts keep their original currency.</Text>
+              </View>
+              {currencyConfigured && <Pressable onPress={() => setCurrencyPickerVisible(false)} style={styles.editorClose}>
+                <Ionicons name="close" size={20} color={COLORS.muted} />
+              </Pressable>}
+            </View>
+            <TextInput
+              autoCapitalize="characters"
+              value={currencySearch}
+              onChangeText={setCurrencySearch}
+              placeholder="Search currency code, e.g. PKR or USD"
+              placeholderTextColor="#77717E"
+              style={styles.editorInput}
+            />
+            <ScrollView keyboardShouldPersistTaps="handled" style={{ marginTop: 12 }} contentContainerStyle={{ paddingBottom: 8 }}>
+              {visibleCurrencies.map((currency) => (
+                <Pressable key={currency} onPress={() => chooseBaseCurrency(currency).catch(() => showDialog("Couldn’t save currency", "Please try again.", undefined, "warning"))} style={[styles.notificationCard, { marginTop: 6 }] }>
+                  <View style={[styles.notificationIcon, { backgroundColor: currency === baseCurrency ? "#DCEDE7" : "#E8E2F2" }]}>
+                    <Text style={{ fontWeight: "900", color: currency === baseCurrency ? COLORS.green : COLORS.purple }}>{currency.slice(0, 2)}</Text>
+                  </View>
+                  <Text style={[styles.notificationTitle, styles.flex]}>{currency}</Text>
+                  {currency === baseCurrency && currencyConfigured && <Ionicons name="checkmark-circle" size={20} color={COLORS.green} />}
+                </Pressable>
+              ))}
+            </ScrollView>
+            <Text style={[styles.notificationCopy, { marginTop: 10 }]}>Exchange rates are indicative daily rates. Only currency codes are sent; notification and transaction data stay on this device.</Text>
+          </MotionView>
+        </KeyboardAvoidingView>
+      </Modal>
+
+      <Modal
+        animationType={reducedMotion ? "none" : "fade"}
         transparent
         visible={overviewSelectorVisible}
         onRequestClose={() => setOverviewSelectorVisible(false)}
       >
         <View style={styles.overviewPickerBackdrop}>
           <Pressable style={StyleSheet.absoluteFill} onPress={() => setOverviewSelectorVisible(false)} />
-          <View style={styles.overviewPickerCard}>
+          <MotionView enterKey={overviewSelectorVisible} fromY={18} style={styles.overviewPickerCard}>
             <View style={styles.overviewPickerHeader}>
               <View>
                 <Text style={styles.calendarEyebrow}>MAIN CARD</Text>
@@ -1601,19 +2475,19 @@ function KharchaApp() {
                 );
               })}
             </View>
-          </View>
+          </MotionView>
         </View>
       </Modal>
 
       <Modal
-        animationType="fade"
+        animationType={reducedMotion ? "none" : "fade"}
         transparent
         visible={Boolean(calendarTarget)}
         onRequestClose={() => setCalendarTarget(null)}
       >
         <View style={styles.calendarBackdrop}>
           <Pressable style={StyleSheet.absoluteFill} onPress={() => setCalendarTarget(null)} />
-          <View style={styles.calendarCard}>
+          <MotionView enterKey={calendarTarget} fromY={18} style={styles.calendarCard}>
             <View style={styles.calendarHeader}>
               <View>
                 <Text style={styles.calendarEyebrow}>CUSTOM DATE</Text>
@@ -1685,19 +2559,70 @@ function KharchaApp() {
               <Ionicons name="locate-outline" size={16} color="#B9AEFF" />
               <Text style={styles.calendarTodayText}>Jump to today</Text>
             </Pressable>
-          </View>
+          </MotionView>
         </View>
       </Modal>
 
       <Modal
-        animationType="fade"
+        animationType={reducedMotion ? "none" : "fade"}
+        transparent
+        visible={Boolean(detailExpense)}
+        onRequestClose={() => setDetailExpense(null)}
+      >
+        <View style={styles.editorBackdrop}>
+          <Pressable style={StyleSheet.absoluteFill} onPress={() => setDetailExpense(null)} />
+          {detailExpense && <MotionView enterKey={detailExpense.id} fromY={18} style={[styles.editorCard, {
+            maxHeight: "86%", backgroundColor: activeThemeDark ? "#24202B" : "#FCFBF8",
+            borderColor: activeThemeDark ? "#51475A" : "#E2DED8",
+          }]}>
+            <ScrollView showsVerticalScrollIndicator={false}>
+              <View style={styles.editorHeader}>
+                <View style={{ flex: 1, paddingRight: 12 }}>
+                  <Text style={styles.editorEyebrow}>TRANSACTION DETAILS</Text>
+                  <Text style={[styles.editorTitle, { color: activeThemeDark ? "#F8F4FA" : "#111111" }]}>{detailExpense.description}</Text>
+                </View>
+                <Pressable onPress={() => setDetailExpense(null)} style={styles.editorClose} accessibilityLabel="Close transaction details">
+                  <Ionicons name="close" size={20} color={activeThemeDark ? "#E8DDEB" : COLORS.muted} />
+                </Pressable>
+              </View>
+              <Text style={{ fontSize: 30, fontWeight: "800", marginVertical: 14,
+                color: detailExpense.type === "credit" ? (activeThemeDark ? "#80D5B5" : "#35A57C") : activeThemeDark ? "#F8F4FA" : "#111111" }}>
+                {detailExpense.type === "credit" ? "+" : "−"} {transactionDisplay(detailExpense).amount}
+              </Text>
+              {transactionDisplay(detailExpense).original ? <Text style={{ color: activeThemeDark ? "#C9BECE" : "#706B66", marginBottom: 12 }}>{transactionDisplay(detailExpense).original}</Text> : null}
+              {([
+                ["Date & time", entryDateTime(detailExpense.createdAt)],
+                ["Category", detailExpense.category],
+                [detailExpense.type === "credit" ? "From" : "To", detailExpense.counterparty || "Not identified in alert"],
+                ["Your account", detailExpense.account || "Not included in alert"],
+                ["Reference", detailExpense.reference || "Not included in alert"],
+                ["Source", detailExpense.sourceSender || (detailExpense.sourceChannel ? detailExpense.sourceChannel : "Manual entry")],
+              ] as [string, string][]).map(([label, value]) => <View key={label} style={{ paddingVertical: 10, borderTopWidth: 1, borderTopColor: activeThemeDark ? "#51475A" : "#E2DED8" }}>
+                <Text style={{ color: activeThemeDark ? "#C4B9CA" : "#817C77", fontSize: 11, fontWeight: "700", letterSpacing: 0.5 }}>{label.toUpperCase()}</Text>
+                <Text selectable style={{ color: activeThemeDark ? "#F8F4FA" : "#111111", fontSize: 15, marginTop: 4 }}>{value}</Text>
+              </View>)}
+              {detailExpense.sourceText ? <View style={{ paddingVertical: 12, borderTopWidth: 1, borderTopColor: activeThemeDark ? "#51475A" : "#E2DED8" }}>
+                <Text style={{ color: activeThemeDark ? "#C4B9CA" : "#817C77", fontSize: 11, fontWeight: "700", letterSpacing: 0.5 }}>ORIGINAL ALERT</Text>
+                <Text selectable style={{ color: activeThemeDark ? "#F8F4FA" : "#111111", lineHeight: 22, fontSize: 14, marginTop: 8 }}>{detailExpense.sourceText}</Text>
+              </View> : null}
+            </ScrollView>
+            <Pressable onPress={() => { const entry = detailExpense; setDetailExpense(null); setTimeout(() => openEditor(entry), 150); }} style={styles.editorSave}>
+              <Ionicons name="create-outline" size={18} color="#FFF" />
+              <Text style={styles.editorSaveText}>Edit transaction</Text>
+            </Pressable>
+          </MotionView>}
+        </View>
+      </Modal>
+
+      <Modal
+        animationType={reducedMotion ? "none" : "fade"}
         transparent
         visible={Boolean(editingExpense)}
         onRequestClose={() => setEditingExpense(null)}
       >
         <KeyboardAvoidingView behavior={Platform.OS === "ios" ? "padding" : undefined} style={styles.editorBackdrop}>
           <Pressable style={StyleSheet.absoluteFill} onPress={() => setEditingExpense(null)} />
-          <View style={styles.editorCard}>
+          <MotionView enterKey={editingExpense?.id} fromY={18} style={styles.editorCard}>
             <View style={styles.editorHeader}>
               <View>
                 <Text style={styles.editorEyebrow}>EDIT TRANSACTION</Text>
@@ -1728,7 +2653,7 @@ function KharchaApp() {
             />
             <Text style={styles.editorLabel}>AMOUNT</Text>
             <View style={styles.editorAmountWrap}>
-              <Text style={styles.editorCurrency}>Rs</Text>
+              <Text style={styles.editorCurrency}>{editCurrency}</Text>
               <TextInput
                 value={editAmount}
                 onChangeText={setEditAmount}
@@ -1737,6 +2662,23 @@ function KharchaApp() {
                 style={styles.editorAmountInput}
               />
             </View>
+            <Text style={[styles.editorLabel, { marginTop: 12 }]}>CURRENCY · AMOUNT IS PRESERVED</Text>
+            <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.categoryPicker}>
+              {transactionCurrencyOptions.map((currency) => {
+                const active = editCurrency === currency;
+                return (
+                  <Pressable
+                    key={currency}
+                    accessibilityRole="button"
+                    accessibilityLabel={`Set transaction currency to ${currency}`}
+                    onPress={() => setEditCurrency(currency)}
+                    style={[styles.categoryChip, active && { backgroundColor: themeMode === "dark" ? "#3A2D48" : "#DCEDE7", borderColor: themeMode === "dark" ? "#BDA6D9" : COLORS.green }]}
+                  >
+                    <Text style={[styles.categoryChipText, active && { color: themeMode === "dark" ? "#E8D8F4" : COLORS.green }]}>{currency}</Text>
+                  </Pressable>
+                );
+              })}
+            </ScrollView>
 
             {editType === "debit" && (
               <>
@@ -1749,10 +2691,10 @@ function KharchaApp() {
                       <Pressable
                         key={category}
                         onPress={() => setEditCategory(category)}
-                        style={[styles.categoryChip, active && { backgroundColor: `${meta.color}2B`, borderColor: meta.color }]}
+                        style={[styles.categoryChip, active && { backgroundColor: `${categoryAccent(category)}2B`, borderColor: categoryAccent(category) }]}
                       >
-                        <Ionicons name={meta.icon} size={14} color={active ? meta.color : COLORS.muted} />
-                        <Text style={[styles.categoryChipText, active && { color: meta.color }]}>{category}</Text>
+                        <Ionicons name={meta.icon} size={14} color={active ? categoryAccent(category) : (themeMode === "dark" ? "#B9AEBD" : COLORS.muted)} />
+                        <Text style={[styles.categoryChipText, active && { color: categoryAccent(category) }]}>{category}</Text>
                       </Pressable>
                     );
                   })}
@@ -1775,7 +2717,7 @@ function KharchaApp() {
               <Ionicons name="trash-outline" size={17} color={COLORS.coral} />
               <Text style={styles.editorDeleteText}>Delete transaction</Text>
             </Pressable>
-          </View>
+          </MotionView>
         </KeyboardAvoidingView>
       </Modal>
 
@@ -1791,7 +2733,9 @@ function KharchaApp() {
 export default function App() {
   return (
     <SafeAreaProvider>
+      <MotionProvider>
       <KharchaApp />
+      </MotionProvider>
     </SafeAreaProvider>
   );
 }
@@ -1886,23 +2830,23 @@ const baseStyles = StyleSheet.create({
   quickReady: { flexDirection: "row", alignItems: "center", gap: 5, borderRadius: 14, backgroundColor: "#242B2A", paddingHorizontal: 8, paddingVertical: 6 },
   quickReadyDot: { width: 5, height: 5, borderRadius: 3, backgroundColor: COLORS.green },
   quickReadyText: { color: "#7BDDB5", fontSize: 6.5, fontWeight: "900", letterSpacing: .7 },
-  typeToggle: { flexDirection: "row", backgroundColor: "#EFECE8", padding: 4, borderRadius: 12, marginBottom: 10 },
-  typeButton: { flex: 1, height: 38, flexDirection: "row", gap: 6, alignItems: "center", justifyContent: "center", borderRadius: 9 },
+  typeToggle: { flexDirection: "row", backgroundColor: "#EFECE8", padding: 4, borderRadius: 14, marginBottom: 12 },
+  typeButton: { flex: 1, minHeight: 52, flexDirection: "row", gap: 8, alignItems: "center", justifyContent: "center", borderRadius: 11 },
   typeButtonDebit: { backgroundColor: "#111111" },
   typeButtonCredit: { backgroundColor: "#BFE1DA" },
-  typeText: { color: "#77736F", fontSize: 10, fontWeight: "800" },
+  typeText: { color: "#77736F", fontSize: 13, fontWeight: "800" },
   typeTextSelected: { color: "#FFF" },
   typeTextCreditSelected: { color: "#111111" },
   quickFieldLabel: { color: "#A4ADA9", fontSize: 9, fontWeight: "700", marginLeft: 2, marginBottom: 6 },
-  descriptionWrap: { height: 48, flexDirection: "row", alignItems: "center", gap: 10, borderRadius: 12, borderWidth: 1, borderColor: "#E2DED8", backgroundColor: "#F7F5F1", paddingHorizontal: 13, marginBottom: 9 },
-  descriptionInput: { flex: 1, height: "100%", color: "#111111", paddingHorizontal: 0, fontSize: 13.5 },
+  descriptionWrap: { minHeight: 60, flexDirection: "row", alignItems: "center", gap: 12, borderRadius: 15, borderWidth: 1, borderColor: "#E2DED8", backgroundColor: "#F7F5F1", paddingHorizontal: 16, marginBottom: 10 },
+  descriptionInput: { flex: 1, minHeight: 58, color: "#111111", paddingHorizontal: 0, fontSize: 15 },
   amountRow: { flexDirection: "row", gap: 8 },
-  amountInputWrap: { flex: 1, height: 50, flexDirection: "row", alignItems: "center", borderRadius: 12, borderWidth: 1, borderColor: "#E2DED8", backgroundColor: "#F7F5F1", paddingLeft: 8 },
+  amountInputWrap: { flex: 1, minHeight: 60, flexDirection: "row", alignItems: "center", borderRadius: 15, borderWidth: 1, borderColor: "#E2DED8", backgroundColor: "#F7F5F1", paddingLeft: 10 },
   currencyBadge: { height: 34, minWidth: 34, borderRadius: 9, backgroundColor: "#E8E2F2", alignItems: "center", justifyContent: "center", marginRight: 7 },
   currency: { color: "#342F3A", fontSize: 10, fontWeight: "900" },
   amountInput: { flex: 1, height: "100%", color: "#111111", fontSize: 18, fontWeight: "900" },
-  addButton: { width: 94, borderRadius: 12, backgroundColor: "#111111", alignItems: "center", justifyContent: "center", flexDirection: "row", gap: 6 },
-  addButtonText: { color: "#FFF", fontSize: 11, fontWeight: "900" },
+  addButton: { width: 112, minHeight: 60, borderRadius: 15, backgroundColor: "#111111", alignItems: "center", justifyContent: "center", flexDirection: "row", gap: 8 },
+  addButtonText: { color: "#FFF", fontSize: 14, fontWeight: "900" },
   hintRow: { flexDirection: "row", alignItems: "center", gap: 5, marginTop: 10, marginLeft: 2 },
   hint: { color: "#8F8996", fontSize: 8.5 },
   homeSectionTop: { flexDirection: "row", alignItems: "center", justifyContent: "space-between", marginTop: 23, marginBottom: 10 },
@@ -1913,13 +2857,14 @@ const baseStyles = StyleSheet.create({
   homeCategoryCard: { width: 108, minHeight: 108, borderRadius: 18, backgroundColor: "#EEEAE5", padding: 12 },
   homeCategoryCardLilac: { backgroundColor: "#E7E0F1" },
   homeCategoryCardMint: { backgroundColor: "#CDE7E1" },
-  homeCategoryIcon: { width: 30, height: 30, borderRadius: 10, backgroundColor: "#FFFFFFAA", alignItems: "center", justifyContent: "center", marginBottom: 12 },
+  homeCategoryIcon: { width: 34, height: 34, borderRadius: 11, backgroundColor: "#FFFFFFAA", alignItems: "center", justifyContent: "center", marginBottom: 10 },
   homeCategoryName: { color: "#504B47", fontSize: 9, fontWeight: "700" },
   homeCategoryValue: { color: "#111111", fontSize: 13, fontWeight: "900", marginTop: 4 },
   homeList: { borderTopWidth: 1, borderTopColor: "#EAE6E0" },
   homeTransaction: { minHeight: 62, flexDirection: "row", alignItems: "center", borderBottomWidth: StyleSheet.hairlineWidth, borderBottomColor: "#E4E0DA" },
   homeTransactionIcon: { width: 36, height: 36, borderRadius: 11, alignItems: "center", justifyContent: "center", marginRight: 10 },
   homeTransactionTitle: { color: "#111111", fontSize: 11.5, fontWeight: "800" },
+  homeTransactionOriginal: { color: "#6F6863", fontSize: 9, fontWeight: "700", marginTop: 2 },
   homeTransactionMeta: { color: "#918C87", fontSize: 8.5, marginTop: 3 },
   homeTransactionAmount: { color: "#111111", fontSize: 10.5, fontWeight: "900" },
   homeCreditAmount: { color: "#2B856B" },
@@ -1954,6 +2899,7 @@ const baseStyles = StyleSheet.create({
   transactionIcon: { width: 37, height: 37, borderRadius: 11, alignItems: "center", justifyContent: "center", marginRight: 10 },
   transactionText: { flex: 1, paddingRight: 8 },
   transactionTitle: { color: COLORS.ink, fontSize: 11.5, fontWeight: "700" },
+  transactionOriginal: { color: "#6F6863", fontSize: 9.5, fontWeight: "700", marginTop: 2 },
   transactionMeta: { color: "#99938B", fontSize: 9, marginTop: 3 },
   transactionAmount: { color: COLORS.ink, fontSize: 10.5, fontWeight: "900" },
   creditAmount: { color: COLORS.green },
@@ -2144,147 +3090,156 @@ const baseStyles = StyleSheet.create({
 });
 
 const darkStyles = StyleSheet.create({
-  safe: { backgroundColor: "#0C0E0D" },
-  homeSafe: { backgroundColor: "#0C0E0D" },
-  headerButton: { backgroundColor: "#191C1A", borderColor: "#303531" },
-  logo: { color: "#F4F5F2" },
-  tagline: { color: "#959C97" },
-  eyebrow: { color: "#9DA29E" },
-  subtitle: { color: "#9DA29E" },
-  pageTitle: { color: "#F4F5F2" },
-  sectionTitle: { color: "#F4F5F2" },
-  sectionAction: { color: "#B9A8D3" },
+  safe: { backgroundColor: "#100E15" },
+  homeSafe: { backgroundColor: "#100E15" },
+  headerButton: { backgroundColor: "#24202B", borderColor: "#47404D" },
+  logo: { color: "#F8F4FA" },
+  tagline: { color: "#C1B8C5" },
+  eyebrow: { color: "#BBB0C2" },
+  subtitle: { color: "#BAB0C0" },
+  pageTitle: { color: "#F8F4FA" },
+  sectionTitle: { color: "#F8F4FA" },
+  sectionAction: { color: "#D6BCEB" },
 
-  homeSheet: { backgroundColor: "#151816", borderColor: "#2B302C", shadowOpacity: .32 },
-  quickTitle: { color: "#F4F5F2" },
-  quickSubtitle: { color: "#969C98" },
-  todayMiniLabel: { color: "#8F9691" },
-  todayMiniValue: { color: "#F4F5F2" },
-  typeToggle: { backgroundColor: "#242825" },
-  typeButtonDebit: { backgroundColor: "#F4F5F2" },
-  typeButtonCredit: { backgroundColor: "#8FC8B6" },
-  typeText: { color: "#9AA09C" },
-  typeTextSelected: { color: "#111311" },
-  descriptionWrap: { backgroundColor: "#1E221F", borderColor: "#343A35" },
-  descriptionInput: { color: "#F4F5F2" },
-  amountInputWrap: { backgroundColor: "#1E221F", borderColor: "#343A35" },
-  currencyBadge: { backgroundColor: "#3A3345" },
-  currency: { color: "#DED4EB" },
-  amountInput: { color: "#F4F5F2" },
-  addButton: { backgroundColor: "#080A09", borderWidth: 1, borderColor: "#363B37" },
-  homeSectionTitle: { color: "#F4F5F2" },
-  homeSectionCaption: { color: "#929994" },
-  homeSectionAction: { color: "#B8AEA7" },
-  homeCategoryCard: { backgroundColor: "#282A28" },
-  homeCategoryCardLilac: { backgroundColor: "#322D3B" },
-  homeCategoryCardMint: { backgroundColor: "#233832" },
+  homeSheet: { backgroundColor: "#1C1922", borderColor: "#3B3442", shadowOpacity: .32 },
+  quickTitle: { color: "#F8F4FA" },
+  quickSubtitle: { color: "#BCB2C0" },
+  todayMiniLabel: { color: "#BAAFBF" },
+  todayMiniValue: { color: "#F8F4FA" },
+  typeToggle: { backgroundColor: "#2B2632" },
+  typeButtonDebit: { backgroundColor: "#D6BEE8" },
+  typeButtonCredit: { backgroundColor: "#BADEC9" },
+  typeText: { color: "#C0B6C4" },
+  typeTextSelected: { color: "#281D32" },
+  descriptionWrap: { backgroundColor: "#27232D", borderColor: "#4C4353" },
+  descriptionInput: { color: "#F8F4FA" },
+  amountInputWrap: { backgroundColor: "#27232D", borderColor: "#4C4353" },
+  currencyBadge: { backgroundColor: "#41334E" },
+  currency: { color: "#E8D8F4" },
+  amountInput: { color: "#F8F4FA" },
+  addButton: { backgroundColor: "#765591", borderWidth: 1, borderColor: "#9272AC" },
+  homeSectionTitle: { color: "#F8F4FA" },
+  homeSectionCaption: { color: "#B6ACB9" },
+  homeSectionAction: { color: "#D4BAE8" },
+  homeCategoryCard: { backgroundColor: "#29252F" },
+  homeCategoryCardLilac: { backgroundColor: "#352B42" },
+  homeCategoryCardMint: { backgroundColor: "#263630" },
   homeCategoryIcon: { backgroundColor: "#FFFFFF12" },
-  homeCategoryName: { color: "#B6BBB7" },
-  homeCategoryValue: { color: "#F4F5F2" },
-  homeList: { borderTopColor: "#2E332F" },
-  homeTransaction: { borderBottomColor: "#2E332F" },
-  homeTransactionTitle: { color: "#F4F5F2" },
-  homeTransactionMeta: { color: "#929994" },
-  homeTransactionAmount: { color: "#F4F5F2" },
-  homeEmpty: { color: "#929994" },
+  homeCategoryName: { color: "#D1C7D5" },
+  homeCategoryValue: { color: "#F8F4FA" },
+  homeList: { borderTopColor: "#403946" },
+  homeTransaction: { borderBottomColor: "#403946" },
+  homeTransactionTitle: { color: "#F8F4FA" },
+  homeTransactionOriginal: { color: "#C4BAC8" },
+  homeTransactionMeta: { color: "#B2A9B6" },
+  homeTransactionAmount: { color: "#F8F4FA" },
+  homeEmpty: { color: "#B2A9B6" },
 
-  dateFilterCard: { backgroundColor: "#171A18", borderColor: "#303531" },
-  dateFilterEyebrow: { color: "#969C98" },
-  dateFilterTitle: { color: "#F4F5F2" },
-  dateFilterIcon: { backgroundColor: "#352F40" },
-  dateChip: { backgroundColor: "#242825", borderColor: "#343A35" },
-  dateChipText: { color: "#A1A6A2" },
-  summaryStrip: { backgroundColor: "#171A18", borderColor: "#303531" },
-  summaryLabel: { color: "#929994" },
-  summaryValue: { color: "#F4F5F2" },
-  summaryDivider: { backgroundColor: "#303531" },
-  listCard: { backgroundColor: "#171A18", borderColor: "#303531" },
-  transaction: { borderBottomColor: "#303531" },
-  transactionTitle: { color: "#F4F5F2" },
-  transactionMeta: { color: "#929994" },
-  transactionAmount: { color: "#F4F5F2" },
-  outlineButton: { backgroundColor: "#171A18", borderColor: "#303531" },
-  outlineButtonText: { color: "#B9A8D3" },
-  emptyDateCard: { backgroundColor: "#171A18", borderColor: "#303531" },
-  emptyDateIcon: { backgroundColor: "#352F40" },
-  emptyDateTitle: { color: "#F4F5F2" },
-  emptyDateCopy: { color: "#929994" },
+  dateFilterCard: { backgroundColor: "#211D27", borderColor: "#403947" },
+  dateFilterEyebrow: { color: "#B9AEBD" },
+  dateFilterTitle: { color: "#F8F4FA" },
+  dateFilterIcon: { backgroundColor: "#3B3049" },
+  dateChip: { backgroundColor: "#2D2833", borderColor: "#4A4152" },
+  dateChipActive: { backgroundColor: "#765591", borderColor: "#A587BB" },
+  dateChipText: { color: "#C1B7C5" },
+  summaryStrip: { backgroundColor: "#211D27", borderColor: "#403947" },
+  summaryLabel: { color: "#B6ABBB" },
+  summaryValue: { color: "#F8F4FA" },
+  summaryDivider: { backgroundColor: "#4A4152" },
+  listCard: { backgroundColor: "#211D27", borderColor: "#403947" },
+  transaction: { borderBottomColor: "#403947" },
+  transactionTitle: { color: "#F8F4FA" },
+  transactionOriginal: { color: "#C4BAC8" },
+  transactionMeta: { color: "#B4AABA" },
+  transactionAmount: { color: "#F8F4FA" },
+  outlineButton: { backgroundColor: "#211D27", borderColor: "#403947" },
+  outlineButtonText: { color: "#D6BCEB" },
+  emptyDateCard: { backgroundColor: "#211D27", borderColor: "#403947" },
+  emptyDateIcon: { backgroundColor: "#3B3049" },
+  emptyDateTitle: { color: "#F8F4FA" },
+  emptyDateCopy: { color: "#B8AEBD" },
 
-  insightLivePill: { backgroundColor: "#20352E", borderColor: "#2C4A40" },
-  insightLiveText: { color: "#82C9B1" },
-  analysisCard: { backgroundColor: "#171A18", borderColor: "#303531" },
-  insightSectionIcon: { backgroundColor: "#352F40" },
-  trendCard: { backgroundColor: "#171A18", borderColor: "#303531" },
-  cashflowCard: { backgroundColor: "#171A18", borderColor: "#303531" },
-  chartTitle: { color: "#F4F5F2" },
-  chartTotalPill: { backgroundColor: "#352F40" },
-  chartTotalText: { color: "#C1AFDC" },
-  weekValue: { color: "#A0A6A1" },
-  weekBarSlot: { backgroundColor: "#292D2A" },
-  weekLabel: { color: "#9CA29D" },
-  flowLabel: { color: "#9CA29D" },
-  flowValue: { color: "#F4F5F2" },
-  flowTrack: { backgroundColor: "#292D2A" },
-  netFlow: { borderTopColor: "#303531" },
-  netFlowLabel: { color: "#9CA29D" },
-  trendDirection: { backgroundColor: "#20352E", color: "#82C9B1" },
-  monthWeekSlot: { backgroundColor: "#292D2A" },
-  monthWeekValue: { color: "#F4F5F2" },
-  metricCard: { backgroundColor: "#171A18", borderColor: "#303531" },
-  metricLabel: { color: "#9CA29D" },
-  metricValue: { color: "#F4F5F2" },
-  donutRing: { backgroundColor: "#292D2A" },
-  donutInner: { backgroundColor: "#171A18" },
-  donutLabel: { color: "#969C98" },
-  donutValue: { color: "#F4F5F2" },
-  legendName: { color: "#A4AAA5" },
-  legendValue: { color: "#F4F5F2" },
-  categoryBarName: { color: "#A4AAA5" },
-  categoryBarPercent: { color: "#969C98" },
-  categoryBarValue: { color: "#F4F5F2" },
-  barTrack: { backgroundColor: "#292D2A" },
-  monthCardLabel: { color: "#A4AAA5" },
-  monthCardValue: { color: "#F4F5F2" },
-  notificationCard: { backgroundColor: "#171A18", borderColor: "#303531" },
-  notificationTitle: { color: "#F4F5F2" },
-  notificationCopy: { color: "#969C98" },
+  insightLivePill: { backgroundColor: "#362942", borderColor: "#5D486B" },
+  insightLiveText: { color: "#E5C9F5" },
+  analysisCard: { backgroundColor: "#211D27", borderColor: "#403947" },
+  insightSectionIcon: { backgroundColor: "#3B3049" },
+  trendCard: { backgroundColor: "#211D27", borderColor: "#403947" },
+  cashflowCard: { backgroundColor: "#211D27", borderColor: "#403947" },
+  chartTitle: { color: "#F8F4FA" },
+  chartTotalPill: { backgroundColor: "#3B3049" },
+  chartTotalText: { color: "#DFC8F0" },
+  weekValue: { color: "#B9AEBD" },
+  weekBarSlot: { backgroundColor: "#312B38" },
+  weekLabel: { color: "#C2B7C7" },
+  flowLabel: { color: "#C2B7C7" },
+  flowValue: { color: "#F8F4FA" },
+  flowTrack: { backgroundColor: "#312B38" },
+  netFlow: { borderTopColor: "#403947" },
+  netFlowLabel: { color: "#C2B7C7" },
+  trendDirection: { backgroundColor: "#2A443B", color: "#9BE4CA" },
+  monthWeekSlot: { backgroundColor: "#312B38" },
+  monthWeekValue: { color: "#F8F4FA" },
+  metricCard: { backgroundColor: "#211D27", borderColor: "#403947" },
+  metricLabel: { color: "#C2B7C7" },
+  metricValue: { color: "#F8F4FA" },
+  donutRing: { backgroundColor: "#312B38" },
+  donutInner: { backgroundColor: "#211D27" },
+  donutLabel: { color: "#BEB3C4" },
+  donutValue: { color: "#F8F4FA" },
+  legendName: { color: "#CDC3D0" },
+  legendValue: { color: "#F8F4FA" },
+  categoryBarName: { color: "#CDC3D0" },
+  categoryBarPercent: { color: "#BEB3C4" },
+  categoryBarValue: { color: "#F8F4FA" },
+  barTrack: { backgroundColor: "#312B38" },
+  monthCardLabel: { color: "#D2DDD5" },
+  monthCardValue: { color: "#F8F4FA" },
+  notificationCard: { backgroundColor: "#211D27", borderColor: "#403947" },
+  notificationTitle: { color: "#F8F4FA" },
+  notificationCopy: { color: "#BEB3C4" },
 
-  appDialogCard: { backgroundColor: "#191C1A", borderColor: "#343A35" },
-  appDialogTitle: { color: "#F4F5F2" },
-  appDialogMessage: { color: "#A3A9A4" },
-  appDialogButtonCancel: { backgroundColor: "#292D2A", borderColor: "#3A403B" },
-  appDialogButtonTextCancel: { color: "#D2D6D2" },
-  overviewPickerCard: { backgroundColor: "#191C1A", borderColor: "#343A35" },
-  overviewPickerCopy: { color: "#9CA29D" },
-  overviewPickerOption: { backgroundColor: "#232724", borderColor: "#363C37" },
-  overviewPickerOptionActive: { backgroundColor: "#352F40", borderColor: "#A792C5" },
-  overviewPickerLabel: { color: "#F4F5F2" },
-  overviewPickerOptionCopy: { color: "#9CA29D" },
-  calendarCard: { backgroundColor: "#191C1A", borderColor: "#343A35" },
-  calendarEyebrow: { color: "#9CA29D" },
-  calendarTitle: { color: "#F4F5F2" },
-  calendarClose: { backgroundColor: "#292D2A" },
-  calendarArrow: { backgroundColor: "#352F40" },
-  calendarMonthText: { color: "#F4F5F2" },
-  calendarWeekRow: { borderBottomColor: "#343A35" },
-  calendarWeekday: { color: "#9CA29D" },
-  calendarDayText: { color: "#D0D4D0" },
-  calendarTodayButton: { backgroundColor: "#352F40" },
-  calendarTodayText: { color: "#C1AFDC" },
-  editorCard: { backgroundColor: "#191C1A", borderColor: "#343A35" },
-  editorTitle: { color: "#F4F5F2" },
-  editorClose: { backgroundColor: "#292D2A" },
-  editorToggle: { backgroundColor: "#292D2A" },
-  editorInput: { backgroundColor: "#232724", borderColor: "#3A403B", color: "#F4F5F2" },
-  editorAmountWrap: { backgroundColor: "#232724", borderColor: "#3A403B" },
-  editorAmountInput: { color: "#F4F5F2" },
-  categoryChip: { backgroundColor: "#232724", borderColor: "#3A403B" },
-  categoryChipText: { color: "#A3A9A4" },
+  appDialogCard: { backgroundColor: "#24202B", borderColor: "#51475A" },
+  appDialogTitle: { color: "#F8F4FA" },
+  appDialogMessage: { color: "#C8BECD" },
+  appDialogButton: { backgroundColor: "#765591" },
+  appDialogButtonCancel: { backgroundColor: "#332D3A", borderColor: "#51475A" },
+  appDialogButtonTextCancel: { color: "#E5DAE9" },
+  overviewPickerCard: { backgroundColor: "#24202B", borderColor: "#51475A" },
+  overviewPickerCopy: { color: "#C4B9CA" },
+  overviewPickerOption: { backgroundColor: "#2E2835", borderColor: "#51475A" },
+  overviewPickerOptionActive: { backgroundColor: "#463453", borderColor: "#BC9BD2" },
+  overviewPickerLabel: { color: "#F8F4FA" },
+  overviewPickerOptionCopy: { color: "#C4B9CA" },
+  calendarCard: { backgroundColor: "#24202B", borderColor: "#51475A" },
+  calendarEyebrow: { color: "#C4B9CA" },
+  calendarTitle: { color: "#F8F4FA" },
+  calendarClose: { backgroundColor: "#342D3B" },
+  calendarArrow: { backgroundColor: "#40334C" },
+  calendarMonthText: { color: "#F8F4FA" },
+  calendarWeekRow: { borderBottomColor: "#51475A" },
+  calendarWeekday: { color: "#C4B9CA" },
+  calendarDayText: { color: "#E7DEEA" },
+  calendarTodayButton: { backgroundColor: "#40334C" },
+  calendarTodayText: { color: "#E2CBF0" },
+  editorCard: { backgroundColor: "#24202B", borderColor: "#51475A" },
+  editorEyebrow: { color: "#C4B9CA" },
+  editorTitle: { color: "#F8F4FA" },
+  editorClose: { backgroundColor: "#342D3B" },
+  editorToggle: { backgroundColor: "#332D3A" },
+  editorTypeText: { color: "#C4B9CA" },
+  editorLabel: { color: "#C4B9CA" },
+  editorCurrency: { color: "#C4B9CA" },
+  editorInput: { backgroundColor: "#2E2835", borderColor: "#51475A", color: "#F8F4FA" },
+  editorAmountWrap: { backgroundColor: "#2E2835", borderColor: "#51475A" },
+  editorAmountInput: { color: "#F8F4FA" },
+  categoryChip: { backgroundColor: "#2E2835", borderColor: "#51475A" },
+  categoryChipText: { color: "#D0C5D4" },
+  editorSave: { backgroundColor: "#765591" },
 
-  tabBar: { backgroundColor: "#171A18", borderColor: "#303531" },
-  homeTabBar: { backgroundColor: "#171A18", borderColor: "#303531", shadowOpacity: .35 },
-  tabText: { color: "#929994" },
-  homeTabTextActive: { color: "#F4F5F2" },
+  tabBar: { backgroundColor: "#211D27", borderColor: "#494150" },
+  homeTabBar: { backgroundColor: "#211D27", borderColor: "#494150", shadowOpacity: .35 },
+  tabText: { color: "#B9AFBF" },
+  homeTabTextActive: { color: "#F8F4FA" },
 });
 
 const styles = new Proxy(baseStyles, {

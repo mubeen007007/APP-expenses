@@ -3,13 +3,13 @@
     "name": "MoneySync",
     "slug": "moneysync",
     "scheme": "kharcha",
-    "version": "2.13.6",
+    "version": "2.13.37",
     "orientation": "default",
     "icon": "./assets/icon.png",
     "userInterfaceStyle": "light",
     "android": {
       "package": "com.moneysync.expensetracker",
-      "versionCode": 40,
+      "versionCode": 71,
       "adaptiveIcon": {
         "backgroundColor": "#F7F7F4",
         "foregroundImage": "./assets/android-icon-foreground.png",

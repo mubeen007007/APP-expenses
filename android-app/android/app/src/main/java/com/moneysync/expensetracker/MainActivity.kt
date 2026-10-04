@@ -17,9 +17,12 @@ class MainActivity : ReactActivity() {
     // This is required for expo-splash-screen.
     setTheme(R.style.AppTheme);
     ExpenseStore.migrateLegacy(this)
-    ExpenseStore.seedPendingBridge(this)
-    ExpenseStore.writeRecoverySnapshot(this)
     super.onCreate(null)
+  }
+
+  override fun onPause() {
+    super.onPause()
+    KharchaWidget.refreshIfPreferencesChanged(this)
   }
 
   /**
